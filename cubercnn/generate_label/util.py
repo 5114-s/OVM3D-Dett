@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import os
 import torch
 from matplotlib.path import Path
-from cubercnn import util
 from sklearn.decomposition import PCA
 import math
 

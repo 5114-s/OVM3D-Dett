@@ -84,7 +84,7 @@ def calc_dis_ray_tracing(wl, Ry, points, bev_box_center):
 
     dis_in = (torch.sum(dis_in_mul, dim=1) == 2).type(torch.bool)
     if torch.sum(dis_in.int()) < 3:
-        return 0
+        return float('inf')
 
     dis_in = dis_in.squeeze(0)
     dis_in_mul = dis_in_mul[:,:,dis_in]
