@@ -550,15 +550,73 @@ def reconstruct_3d(
 
     print(f"   ⏱️  Reconstruction time: {elapsed:.2f}s")
 
+    # 提取 pointmap_scale 和 pointmap_shift（用于反归一化）
+    # 这些参数用于将归一化的坐标转换回物理单位
+    if output is not None:
+        # 检查是否有 scale/shift 参数
+        output['scene_scale'] = output.get('scale', None)
+        output['scene_shift'] = output.get('shift', None)
+        
+        # 检查是否有原始 pointmap（物理坐标）
+        if 'pointmap' in output:
+            print(f"   📏 Pointmap shape: {output['pointmap'].shape}")
+            
+            # pointmap 中间可能包含物理深度信息
+            # 尝试获取物理深度
+            if hasattr(output['pointmap'], 'cpu'):
+                pm = output['pointmap'].cpu().numpy()
+            else:
+                pm = output['pointmap']
+            
+            if isinstance(pm, np.ndarray) and pm.ndim >= 3:
+                # 假设格式是 [H, W, 3] 或 [B, H, W, 3]
+                if pm.shape[-1] == 3:
+                    # 计算物理深度统计
+                    valid_mask = pm[..., 2] > 0
+                    if valid_mask.any():
+                        depth_stats = {
+                            'mean': float(pm[..., 2][valid_mask].mean()),
+                            'min': float(pm[..., 2][valid_mask].min()),
+                            'max': float(pm[..., 2][valid_mask].max())
+                        }
+                        output['depth_stats'] = depth_stats
+                        print(f"   📏 Physical depth stats: mean={depth_stats['mean']:.3f}m, range=[{depth_stats['min']:.3f}, {depth_stats['max']:.3f}]")
+
     return output
 
 
-def save_gs_as_ply(gs_model, output_path: str):
-    """保存高斯溅射为 PLY"""
+def save_gs_as_ply(gs_model, output_path: str, denormalize: bool = False, 
+                   scale: torch.Tensor = None, shift: torch.Tensor = None):
+    """
+    保存高斯溅射为 PLY
+    
+    Args:
+        gs_model: 高斯溅射模型
+        output_path: 输出路径
+        denormalize: 是否反归一化回物理单位
+        scale: 点云的 scale 参数（用于反归一化）
+        shift: 点云的 shift 参数（用于反归一化）
+    """
     from plyfile import PlyData, PlyElement
     
     xyz = gs_model._xyz.detach().cpu().numpy()
     f_dc = gs_model._features_dc.detach().contiguous().cpu().numpy()
+    
+    # 如果需要反归一化
+    if denormalize and scale is not None and shift is not None:
+        # 将 scale 和 shift 转换到正确设备
+        if isinstance(scale, torch.Tensor):
+            scale_np = scale.detach().cpu().numpy()
+        else:
+            scale_np = np.array(scale)
+        if isinstance(shift, torch.Tensor):
+            shift_np = shift.detach().cpu().numpy()
+        else:
+            shift_np = np.array(shift)
+        
+        # 反归一化公式: point_physical = point_normalized * scale + shift
+        # 需要先计算逆变换
+        xyz = xyz * scale_np + shift_np
     
     SH_C0 = 0.28209479177387814
     rgb = 0.5 + (SH_C0 * f_dc)
@@ -678,60 +736,158 @@ def extract_bbox_from_ply(ply_path: str, prior: list = None, ground_equ: np.ndar
                 cy += cdis - dy / 2
     
     # ========== 边界框生成 ==========
-    # 如果尺寸在合理范围内，直接使用
-    if (l * 0.5 <= dx and w * 0.5 <= dz) or (l * 0.5 <= dz and w * 0.5 <= dx):
-        vertives = convert_box_vertices(cx, cy, cz, dx, dy, dz, 0).astype(np.float16)
-        vertives = np.dot(rotate_y(-yaw), vertives.T).T
-        vertives = np.dot(vertives, rotation_matrix.T)
-        center = vertives.mean(axis=0)
-        dimensions = [dx, dy, dz]  # Omni3D 标准格式: [width, height, length]
-        R_cam = rotation_matrix @ rotate_y(-yaw)
-    else:
-        # ========== 射线追踪优化 ==========
+    # 始终使用点云实际边界计算中心
+    vertives = convert_box_vertices(cx, cy, cz, dx, dy, dz, 0).astype(np.float16)
+    vertives = np.dot(rotate_y(-yaw), vertives.T).T
+    vertives = np.dot(vertives, rotation_matrix.T)
+    # 从正确旋转后的顶点计算中心（保持一致性）
+    center = vertives.mean(axis=0)
+    dimensions = [dx, dy, dz]  # Omni3D 标准格式: [width, height, length]
+    R_cam = rotation_matrix @ rotate_y(-yaw)
+    
+    # 如果尺寸太离谱，尝试射线追踪优化，但保持点云中心不变
+    if not (l * 0.5 <= dx and w * 0.5 <= dz) and not (l * 0.5 <= dz and w * 0.5 <= dx):
+        # 尺寸不合理，只调整尺寸，不改变中心
         possible_bboxs = generate_possible_bboxs(cx, cz, dx, dz, w, l)
-        min_loss, best_vertives = float('inf'), None
-        best_dims = None
+        min_loss, best_dims = float('inf'), None
         
         for possible_bbox in possible_bboxs:
             x_min, x_max, z_min, z_max = possible_bbox
             dx_box, dz_box = x_max - x_min, z_max - z_min
-            cx_box, cz_box = (x_min + x_max) / 2, (z_min + z_max) / 2
             
             inside_ratio = calc_inside_ratio(rotated_pc_2.T, x_min, x_max, z_min, z_max)
-            vertives = convert_box_vertices(cx_box, cy, cz_box, dx_box, dy, dz_box, 0).astype(np.float16)
-            vertives = np.dot(rotate_y(-yaw), vertives.T).T
-            new_cx, new_cz = vertives[:, 0].mean(), vertives[:, 2].mean()
-            
-            pc_tensor = torch.from_numpy(rotated_pc).float()
-            loss_ray_tracing = calc_dis_ray_tracing(
-                torch.Tensor([dz_box, dx_box]),
-                torch.Tensor([yaw]),
-                pc_tensor[:, [0, 2]],
-                torch.Tensor([new_cx, new_cz])
-            )
             loss_inside_ratio = 1 - inside_ratio
-            loss = loss_ray_tracing + 5 * loss_inside_ratio
             
-            if loss < min_loss:
-                min_loss = loss
-                best_vertives = vertives
+            if loss_inside_ratio < min_loss:
+                min_loss = loss_inside_ratio
                 best_dims = (dz_box, dx_box)
-
-        if best_vertives is None or best_dims is None:
-            # fallback: use the raw bounds bbox (in rotated_pc_2 frame)
-            dz_fallback, dx_fallback = float(dz), float(dx)
-            vertives = convert_box_vertices(cx, cy, cz, dx_fallback, dy, dz_fallback, 0).astype(np.float16)
+        
+        if best_dims is not None:
+            dz_box, dx_box = best_dims
+            vertives = convert_box_vertices(cx, cy, cz, dx_box, dy, dz_box, 0).astype(np.float16)
             vertives = np.dot(rotate_y(-yaw), vertives.T).T
             vertives = np.dot(vertives, rotation_matrix.T)
+            dimensions = [dx_box, dy, dz_box]
+            # 从顶点重新计算中心（保持一致性）
             center = vertives.mean(axis=0)
-            dimensions = [dx_fallback, dy, dz_fallback]  # Omni3D 标准格式
-            R_cam = rotation_matrix @ rotate_y(-yaw)
-        else:
+    
+    return {
+        'center_cam': center.tolist(),
+        'dimensions': dimensions,  # [dx, dy, dz] Omni3D 标准格式: [width, height, length]
+        'R_cam': R_cam.tolist(),
+        'yaw': float(yaw),
+        'vertices': vertives.tolist() if isinstance(vertives, np.ndarray) else vertives
+    }
+
+
+def extract_bbox_from_points(points: np.ndarray, prior: list = None, ground_equ: np.ndarray = None) -> dict:
+    """
+    从点云数组提取 3D 边界框（不依赖PLY文件）
+    
+    关键特性:
+    1. 地面平面检测和约束
+    2. PCA 在 XZ 平面估计 yaw
+    3. 射线追踪 + inside_ratio 优化（当尺寸不合理时）
+    4. 类别先验约束
+    
+    Args:
+        points: Nx3 点云数组（已经是物理单位）
+        prior: 类别先验尺寸 [width, height, depth]
+        ground_equ: 地面平面方程
+    """
+    from sklearn.decomposition import PCA
+    from cubercnn.generate_label.util import (
+        rotation_matrix_from_vectors, rotate_y, convert_box_vertices,
+        point_to_plane_distance, generate_possible_bboxs
+    )
+    from cubercnn.generate_label.raytrace import calc_inside_ratio, calc_dis_ray_tracing
+    
+    # 下采样
+    if points.shape[0] > 500:
+        indices = np.random.choice(points.shape[0], 500, replace=False)
+        points = points[indices]
+    
+    w, h, l = prior if prior else [0.5, 0.5, 0.5]
+    
+    # ========== 地面约束 ==========
+    if ground_equ is None:
+        try:
+            ground_equ = fit_ground_plane_from_points(points)
+        except:
+            ground_equ = None
+    
+    if ground_equ is not None:
+        dot_product = np.dot([0, -1, 0], ground_equ[:3])
+        if dot_product <= 0:
+            ground_equ = -ground_equ
+        new_ground_equ = np.array([0, -1, 0, point_to_plane_distance(ground_equ, 0, 0, 0)])
+        rotation_matrix = rotation_matrix_from_vectors([0, -1, 0], ground_equ[:3])
+    else:
+        rotation_matrix = np.eye(3)
+    
+    rotated_pc = np.dot(points, rotation_matrix)
+    
+    # ========== PCA 确定 Yaw (在 XZ 平面) ==========
+    pca = PCA(2)
+    pca.fit(rotated_pc[:, [0, 2]])
+    yaw_vec = pca.components_[0, :]
+    yaw = np.arctan2(yaw_vec[1], yaw_vec[0])
+    
+    # 旋转点云对齐 x 轴
+    rotated_pc_2 = rotate_y(yaw) @ rotated_pc.T
+    rotated_pc_2 = rotated_pc_2.T
+    
+    # 计算边界
+    x_min, x_max = rotated_pc_2[:, 0].min(), rotated_pc_2[:, 0].max()
+    y_min, y_max = rotated_pc_2[:, 1].min(), rotated_pc_2[:, 1].max()
+    z_min, z_max = rotated_pc_2[:, 2].min(), rotated_pc_2[:, 2].max()
+    
+    dx, dy, dz = x_max - x_min, y_max - y_min, z_max - z_min
+    cx, cy, cz = (x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2
+    
+    # ========== 高度约束 ==========
+    if dy < h * 0.5:
+        dy = h
+        if ground_equ is not None:
+            cdis = point_to_plane_distance(new_ground_equ, cx, cy, cz)
+            if cdis - dy / 2 < 0.5:
+                cy += cdis - dy / 2
+    
+    # ========== 边界框生成 ==========
+    # 始终使用点云实际边界计算中心
+    vertives = convert_box_vertices(cx, cy, cz, dx, dy, dz, 0).astype(np.float16)
+    vertives = np.dot(rotate_y(-yaw), vertives.T).T
+    vertives = np.dot(vertives, rotation_matrix.T)
+    # 从正确旋转后的顶点计算中心（保持一致性）
+    center = vertives.mean(axis=0)
+    dimensions = [dx, dy, dz]  # Omni3D 标准格式: [width, height, length]
+    R_cam = rotation_matrix @ rotate_y(-yaw)
+    
+    # 如果尺寸太离谱，尝试射线追踪优化，但保持点云中心不变
+    if not (l * 0.5 <= dx and w * 0.5 <= dz) and not (l * 0.5 <= dz and w * 0.5 <= dx):
+        # 尺寸不合理，只调整尺寸，不改变中心
+        possible_bboxs = generate_possible_bboxs(cx, cz, dx, dz, w, l)
+        min_loss, best_dims = float('inf'), None
+        
+        for possible_bbox in possible_bboxs:
+            x_min, x_max, z_min, z_max = possible_bbox
+            dx_box, dz_box = x_max - x_min, z_max - z_min
+            
+            inside_ratio = calc_inside_ratio(rotated_pc_2.T, x_min, x_max, z_min, z_max)
+            loss_inside_ratio = 1 - inside_ratio
+            
+            if loss_inside_ratio < min_loss:
+                min_loss = loss_inside_ratio
+                best_dims = (dz_box, dx_box)
+        
+        if best_dims is not None:
             dz_box, dx_box = best_dims
-            vertives = np.dot(best_vertives, rotation_matrix.T)
+            vertives = convert_box_vertices(cx, cy, cz, dx_box, dy, dz_box, 0).astype(np.float16)
+            vertives = np.dot(rotate_y(-yaw), vertives.T).T
+            vertives = np.dot(vertives, rotation_matrix.T)
+            dimensions = [dx_box, dy, dz_box]
+            # 从顶点重新计算中心（保持一致性）
             center = vertives.mean(axis=0)
-            dimensions = [dx_box, dy, dz_box]  # Omni3D 标准格式
-            R_cam = rotation_matrix @ rotate_y(-yaw)
     
     return {
         'center_cam': center.tolist(),
@@ -898,8 +1054,19 @@ def process_single_image(
                 raise ValueError(f"Fast-SAM3D output missing 'gs' key. Available keys: {list(output.keys())}")
             if 'glb' not in output or output['glb'] is None:
                 raise ValueError("Fast-SAM3D output missing 'glb'")
-        
-            # 保存 Mesh
+            
+            # 获取 scale 和 shift 用于反归一化
+            # FastSAM3D 输出中包含 scale/shift 用于 SSI 归一化
+            # 注意: 输出键是 'scale' 和 'translation'，不是 'shift'
+            scene_scale = output.get('scale', None)
+            scene_shift = output.get('translation', output.get('shift', None))
+            
+            if scene_scale is not None:
+                print(f"    📏 Scale available: {scene_scale}")
+            if scene_shift is not None:
+                print(f"    📏 Translation available: {scene_shift}")
+            
+            # 保存 Mesh（使用原始归一化坐标，因为需要计算相对位置）
             mesh_filename = f"{label.replace(' ', '_')}_{i}.ply"
             mesh_path = os.path.join(mesh_dir, mesh_filename)
             save_gs_as_ply(output['gs'], mesh_path)
@@ -907,9 +1074,254 @@ def process_single_image(
             glb_filename = f"{label.replace(' ', '_')}_{i}.glb"
             output['glb'].export(os.path.join(mesh_dir, glb_filename))
             
-            # ============ 边界框提取 ============
-            print(f"    📦 Extracting BBox...")
-            bbox = extract_bbox_from_ply(mesh_path, prior)
+            # ============ 边界框提取（使用 Fast-SAM3D 输出的物理空间 translation/scale） ============
+            print(f"    📦 Extracting BBox using Fast-SAM3D output...")
+            
+            # Fast-SAM3D 的 pose_decoder 已经将 translation 和 scale 转换到物理空间
+            # 直接使用这些值，而不是从点云重新计算
+            fastsam_translation = output.get('translation', None)
+            fastsam_scale = output.get('scale', None)
+            
+            if fastsam_translation is not None and fastsam_scale is not None:
+                # 转换为 numpy
+                if isinstance(fastsam_translation, torch.Tensor):
+                    fastsam_translation = fastsam_translation.detach().cpu().numpy()
+                if isinstance(fastsam_scale, torch.Tensor):
+                    fastsam_scale = fastsam_scale.detach().cpu().numpy()
+                
+                # 处理 batch 维度
+                if fastsam_translation.ndim > 1:
+                    fastsam_translation = fastsam_translation[0]
+                if fastsam_scale.ndim > 1:
+                    fastsam_scale = fastsam_scale[0]
+                
+                # 检查有效性
+                if np.all(np.isfinite(fastsam_translation)) and np.all(np.isfinite(fastsam_scale)):
+                    print(f"    ✅ Using Fast-SAM3D translation: {fastsam_translation}")
+                    print(f"    ✅ Using Fast-SAM3D scale: {fastsam_scale}")
+                    
+                    # Fast-SAM3D 输出的 translation 是物体中心位置，scale 是物体尺寸
+                    center = fastsam_translation
+                    bbox_size = fastsam_scale
+                    
+                    print(f"    📏 BBox from Fast-SAM3D: center={center}, size={bbox_size}")
+                else:
+                    print(f"    ⚠️  Invalid translation or scale, falling back to point cloud")
+                    center = None
+                    bbox_size = None
+            else:
+                print(f"    ⚠️  Missing Fast-SAM3D translation/scale, falling back to point cloud")
+                center = None
+                bbox_size = None
+            
+            # 如果 Fast-SAM3D 输出不可用，从点云计算
+            if center is None or bbox_size is None:
+                # 读取归一化的点云
+                from plyfile import PlyData
+                plydata = PlyData.read(mesh_path)
+                vertex = plydata['vertex']
+                xyz_normalized = np.stack([
+                    np.array(vertex['x']),
+                    np.array(vertex['y']),
+                    np.array(vertex['z'])
+                ], axis=1)
+                
+                try:
+                    # 确保是 numpy 数组
+                    if isinstance(scene_scale, torch.Tensor):
+                        scene_scale = scene_scale.detach().cpu().numpy()
+                    if isinstance(scene_shift, torch.Tensor):
+                        scene_shift = scene_shift.detach().cpu().numpy()
+                    
+                    # 处理 batch 维度
+                    if scene_scale.ndim > 1:
+                        scene_scale = scene_scale[0]
+                    if scene_shift.ndim > 1:
+                        scene_shift = scene_shift[0]
+                    
+                    # 检查 scale/shift 是否有效（不是全零或无穷大）
+                    if np.all(np.isfinite(scene_scale)) and np.all(np.isfinite(scene_shift)):
+                        # 反归一化: point_physical = point_normalized * scale + shift
+                        xyz_physical = xyz_normalized * scene_scale + scene_shift
+                        print(f"    📏 Point cloud denormalized: scale={scene_scale}, translation={scene_shift}")
+                        print(f"    📏 Physical coords range: X=[{xyz_physical[:,0].min():.3f}, {xyz_physical[:,0].max():.3f}], Z=[{xyz_physical[:,2].min():.3f}, {xyz_physical[:,2].max():.3f}]")
+                        
+                        # 从点云计算 center 和 size
+                        center = (xyz_physical.max(axis=0) + xyz_physical.min(axis=0)) / 2
+                        bbox_size = xyz_physical.max(axis=0) - xyz_physical.min(axis=0)
+                except Exception as e:
+                    print(f"    ⚠️  Failed to denormalize: {e}")
+            
+            # 最终提取边界框
+            if center is not None and bbox_size is not None:
+                # ================================================================
+                # 正确策略：点云定绝对位置，Mesh/Scale 定相对形状
+                # ================================================================
+                
+                # 1. 从点云计算真正的边界框中心（质心）
+                # 单目深度网络对图像整体透视把握极好，质心非常稳定
+                from plyfile import PlyData
+                plydata = PlyData.read(mesh_path)
+                vertex = plydata['vertex']
+                xyz_normalized = np.stack([
+                    np.array(vertex['x']),
+                    np.array(vertex['y']),
+                    np.array(vertex['z'])
+                ], axis=1)
+                
+                # 反归一化点云到物理空间
+                if isinstance(scene_scale, torch.Tensor):
+                    scene_scale_np = scene_scale.detach().cpu().numpy()
+                else:
+                    scene_scale_np = scene_scale
+                if isinstance(scene_shift, torch.Tensor):
+                    scene_shift_np = scene_shift.detach().cpu().numpy()
+                else:
+                    scene_shift_np = scene_shift
+                
+                if scene_scale_np is not None and scene_shift_np is not None:
+                    if scene_scale_np.ndim > 1:
+                        scene_scale_np = scene_scale_np[0]
+                    if scene_shift_np.ndim > 1:
+                        scene_shift_np = scene_shift_np[0]
+                    xyz_physical = xyz_normalized * scene_scale_np + scene_shift_np
+                else:
+                    xyz_physical = xyz_normalized
+                
+                # 点云质心作为边界框中心（绝对位置更准）
+                center_from_pointcloud = xyz_physical.mean(axis=0)
+                print(f"    ✅ Center from point cloud: {center_from_pointcloud}")
+                
+                # 2. 从 Fast-SAM3D 的 scale 计算边界框尺寸
+                # Mesh 具有完整的 3D 包裹性，有合理的物理厚度
+                if isinstance(bbox_size, torch.Tensor):
+                    bbox_size_np = bbox_size.detach().cpu().numpy()
+                else:
+                    bbox_size_np = bbox_size
+                if bbox_size_np.ndim > 1:
+                    bbox_size_np = bbox_size_np[0]
+                
+                # 2. 从 Mesh 顶点计算真正的边界框尺寸
+                # Fast-SAM3D 生成的 mesh 包含完整的 3D 形状
+                mesh_vertices = None
+                if 'mesh' in output and output['mesh'] is not None:
+                    mesh = output['mesh']
+                    try:
+                        # 尝试从 mesh 中提取顶点
+                        if hasattr(mesh, 'vertices'):
+                            verts = mesh.vertices
+                            if hasattr(verts, 'numpy'):
+                                mesh_vertices = verts.numpy()
+                            elif isinstance(verts, np.ndarray):
+                                mesh_vertices = verts
+                        elif isinstance(mesh, np.ndarray):
+                            mesh_vertices = mesh
+                    except:
+                        pass
+                
+                # 如果没有 mesh，退回到使用 scale
+                if mesh_vertices is None:
+                    # 使用 Fast-SAM3D 的 scale 作为 fallback
+                    scale_val = np.abs(bbox_size_np[0]) if len(bbox_size_np) > 0 else 1.0
+                    dx = dy = dz = scale_val
+                    print(f"    📏 Using Fast-SAM3D scale (no mesh): {scale_val:.3f}")
+                else:
+                    # 从 mesh 顶点计算物理尺寸
+                    if mesh_vertices.ndim == 3:
+                        mesh_vertices = mesh_vertices.reshape(-1, 3)
+                    
+                    # 反归一化到物理空间
+                    if scene_scale_np is not None and scene_shift_np is not None:
+                        mesh_physical = mesh_vertices * scene_scale_np + scene_shift_np
+                    else:
+                        mesh_physical = mesh_vertices
+                    
+                    # 计算长宽高（考虑旋转后）
+                    mesh_min = mesh_physical.min(axis=0)
+                    mesh_max = mesh_physical.max(axis=0)
+                    dx = max(0.01, mesh_max[0] - mesh_min[0])
+                    dy = max(0.01, mesh_max[1] - mesh_min[1])
+                    dz = max(0.01, mesh_max[2] - mesh_min[2])
+                    print(f"    📏 Mesh physical size: [{dx:.3f}, {dy:.3f}, {dz:.3f}]")
+                
+                print(f"    📏 Raw size: [{dx:.3f}, {dy:.3f}, {dz:.3f}]")
+                
+                # 3. 用 prior 进行合理性校验和调整
+                if prior is not None and any(p > 0 for p in prior):
+                    prior_dims = np.array(prior)
+                    prior_volume = prior_dims[0] * prior_dims[1] * prior_dims[2]
+                    current_volume = dx * dy * dz
+                    
+                    # 检查体积比例
+                    if prior_volume > 0:
+                        volume_ratio = current_volume / prior_volume
+                    else:
+                        volume_ratio = 1.0
+                    
+                    # 如果尺寸太离谱（体积比例异常），用 prior 替换
+                    if volume_ratio < 0.2 or volume_ratio > 5.0:
+                        print(f"    ⚠️  Size unreasonable (vol_ratio={volume_ratio:.2f}), using prior")
+                        dx, dy, dz = prior_dims[0], prior_dims[1], prior_dims[2]
+                    else:
+                        print(f"    📏 Size healthy (vol_ratio={volume_ratio:.2f}), keeping mesh size")
+                
+                dimensions = [float(dx), float(dy), float(dz)]
+                
+                # 确保尺寸为正数
+                if dx <= 0 or dy <= 0 or dz <= 0:
+                    print(f"    ⚠️  Negative size detected [{dx:.3f}, {dy:.3f}, {dz:.3f}], using prior")
+                    if prior is not None:
+                        dimensions = [float(p) for p in prior]
+                        dx, dy, dz = dimensions
+                
+                # 4. 提取旋转（从 Fast-SAM3D 的 rotation 输出）
+                rotation = output.get('rotation', None)
+                R_cam = np.eye(3, dtype=np.float32)
+                yaw = 0.0
+                if rotation is not None:
+                    if isinstance(rotation, torch.Tensor):
+                        rotation = rotation.detach().cpu().numpy()
+                    if rotation.ndim > 1:
+                        rotation = rotation[0]
+                    try:
+                        from scipy.transform import Rotation as R_scipy
+                        r = R_scipy.from_quat(rotation)
+                        R_cam = r.as_matrix().astype(np.float32)
+                        yaw = np.arctan2(R_cam[0, 2] - R_cam[2, 0], R_cam[0, 0] + R_cam[2, 2]) if R_cam[0, 0] != 0 or R_cam[2, 2] != 0 else 0
+                    except:
+                        pass
+                
+                # 使用点云质心作为最终中心
+                final_center = center_from_pointcloud
+                
+                # 构造边界框
+                from cubercnn.generate_label.util import convert_box_vertices
+                vertives = convert_box_vertices(
+                    final_center[0], final_center[1], final_center[2],
+                    dx, dy, dz, yaw
+                ).astype(np.float16)
+                
+                bbox = {
+                    'center_cam': final_center.tolist(),
+                    'dimensions': dimensions,
+                    'R_cam': R_cam.tolist(),
+                    'yaw': float(yaw),
+                    'vertices': vertives.tolist()
+                }
+                print(f"    ✅ Final BBox: center={final_center}, size=[{dx:.3f}, {dy:.3f}, {dz:.3f}]")
+            else:
+                # Fast-SAM3D 失败，回退到使用点云计算
+                # 确保 xyz_physical 存在
+                if 'xyz_physical' not in dir():
+                    from plyfile import PlyData
+                    plydata = PlyData.read(mesh_path)
+                    vertex = plydata['vertex']
+                    xyz_physical = np.stack([
+                        np.array(vertex['x']),
+                        np.array(vertex['y']),
+                        np.array(vertex['z'])
+                    ], axis=1)
+                bbox = extract_bbox_from_points(xyz_physical, prior)
             
             boxes3d_list.append(np.array(bbox['vertices'], dtype=np.float16))
             center_cam_list.append(np.array(bbox['center_cam']))
@@ -1337,19 +1749,6 @@ def main():
         
         return  # 结束 Step 3/4
         
-    elif args.image_list and os.path.exists(args.image_list):
-        with open(args.image_list, 'r') as f:
-            image_files = [line.strip() for line in f if line.strip()]
-        image_data = [{'id': f, 'path': os.path.join(args.image_dir or '', f)} for f in image_files]
-        
-    elif args.image_dir:
-        image_files = [f for f in os.listdir(args.image_dir) 
-                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        image_data = [{'id': f, 'path': os.path.join(args.image_dir, f)} for f in image_files]
-    else:
-        print("❌ Please specify --json_file or --image_dir")
-        return
-    
     # 限制处理数量
     if args.max_images:
         image_data = image_data[:args.max_images]
