@@ -85,6 +85,13 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
     
     # 创建 image_id 到 image 信息的映射
     image_id_to_info = {img['id']: img for img in source_data['images']}
+    # 使用项目内标准 SUNRGBD 类别表，避免继承缺类模板
+    if dataset_name == 'SUNRGBD':
+        categories = COCO_CATEGORIES
+    else:
+        categories = source_data['categories']
+
+    category_name_to_id = {cat['name']: cat['id'] for cat in categories}
     
     # 统计
     stats = {
@@ -118,6 +125,8 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
         center_cam = img_data['center_cam']
         dimensions = img_data['dimensions']
         R_cam = img_data['R_cam']
+        image_width = img_info['width']
+        image_height = img_info['height']
         
         for j in range(len(phrases)):
             cat_name = phrases[j]
@@ -139,7 +148,9 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
                 stats['invalid_3d'] += 1
             
             # 获取类别 ID
-            if cat_name in SUNRGBD_CATEGORIES:
+            if cat_name in category_name_to_id:
+                cat_id = category_name_to_id[cat_name]
+            elif cat_name in SUNRGBD_CATEGORIES:
                 cat_id = SUNRGBD_CATEGORIES[cat_name]
             else:
                 stats['unknown_category'] += 1
@@ -149,6 +160,16 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
             bbox = boxes[j]
             if hasattr(bbox, 'tolist'):
                 bbox = bbox.tolist()
+            bbox = [float(x) for x in bbox]
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                if max(abs(v) for v in bbox) <= 2.0:
+                    bbox = [
+                        x1 * image_width,
+                        y1 * image_height,
+                        x2 * image_width,
+                        y2 * image_height,
+                    ]
             
             # 转换 boxes3d
             bbox3d = boxes3d[j]
@@ -181,8 +202,8 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
                 'category_name': str(cat_name),
                 'category_id': int(cat_id),
                 'valid3D': bool(is_valid_3d),
-                'bbox2D_tight': [-1, -1, -1, -1],
-                'bbox2D_trunc': [-1, -1, -1, -1],
+                'bbox2D_tight': [float(x) for x in bbox],
+                'bbox2D_trunc': [float(x) for x in bbox],
                 'bbox2D_proj': [float(x) for x in bbox],
                 'bbox3D_cam': [[float(x) for x in row] for row in bbox3d],
                 'center_cam': [float(x) for x in center],
@@ -204,7 +225,7 @@ def convert_to_omni3d_format(source_json_path, info_pth_path, output_path, datas
     output_data = {
         'info': source_data['info'],
         'images': source_data['images'],
-        'categories': COCO_CATEGORIES,
+        'categories': categories,
         'annotations': annotations
     }
     

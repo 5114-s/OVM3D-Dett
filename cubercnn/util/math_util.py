@@ -385,7 +385,8 @@ def compute_priors(cfg, datasets, max_cluster_rounds=1000, min_points_for_std=5)
         First compute static variable statistics
         '''
 
-        scales = torch.FloatTensor(np.array(df_cat.scale))
+        scales = torch.as_tensor(pd.to_numeric(df_cat.scale, errors='coerce').to_numpy(dtype=np.float32), dtype=torch.float32)
+        scales = scales[~torch.isnan(scales)]
         n = len(scales)
 
         if n > 0:
