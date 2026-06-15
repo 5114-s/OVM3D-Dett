@@ -13,3 +13,6 @@ logs/
 pseudo_label_gsam_*/
 Fast-SAM3D/
 third_party/Grounded-SAM-2/
+nohup.out
+outputs/
+pseudo_label/

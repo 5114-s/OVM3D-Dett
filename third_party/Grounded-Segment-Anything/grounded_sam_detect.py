@@ -4,6 +4,30 @@ import os
 import copy
 import io
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_GROUNDING_DINO_DIR = os.path.join(_THIS_DIR, "GroundingDINO")
+_SEGMENT_ANYTHING_DIR = os.path.join(_THIS_DIR, "segment_anything")
+for _path in (_GROUNDING_DINO_DIR, _SEGMENT_ANYTHING_DIR, _THIS_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+
+def resolve_sam_checkpoint():
+    candidates = [
+        os.environ.get("SAM_CHECKPOINT"),
+        os.path.join(os.getcwd(), "sam_vit_h_4b8939.pth"),
+        os.path.join(_THIS_DIR, "sam_vit_h_4b8939.pth"),
+        os.path.join(os.path.dirname(os.path.dirname(_THIS_DIR)), "sam_vit_h_4b8939.pth"),
+        "/data/ZhaoX/ovmono3d/checkpoints/sam_vit_h_4b8939.pth",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "SAM checkpoint sam_vit_h_4b8939.pth not found. "
+        "Set SAM_CHECKPOINT=/path/to/sam_vit_h_4b8939.pth."
+    )
+
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -128,7 +152,7 @@ ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
 groundingdino_model = load_model_hf(ckpt_repo_id, ckpt_filenmae, ckpt_config_filename).cuda()
 
 device = 'cuda'
-sam_checkpoint = 'sam_vit_h_4b8939.pth'
+sam_checkpoint = resolve_sam_checkpoint()
 sam = build_sam(checkpoint=sam_checkpoint)
 sam.to(device=device)
 sam_predictor = SamPredictor(sam)
