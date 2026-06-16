@@ -16,3 +16,4 @@ third_party/Grounded-SAM-2/
 nohup.out
 outputs/
 pseudo_label/
+*.docx

@@ -1658,7 +1658,10 @@ def boxer_quality_score(
     ground_metrics: dict,
     args: argparse.Namespace,
 ) -> float:
-    score_term = float(np.clip(boxer_score, 0.0, 1.0))
+    if math.isfinite(float(boxer_score)):
+        score_term = float(np.clip(boxer_score, 0.0, 1.0))
+    else:
+        score_term = 0.0
     proj_term = float(np.clip(proj_iou / max(float(args.min_proj_iou) * 4.0, 0.20), 0.0, 1.0))
     support_term = 0.5 if depth_support < 0 else float(np.clip(depth_support, 0.0, 1.0))
     if math.isfinite(depth_rel_error) and depth_rel_error >= 0:
@@ -1686,6 +1689,24 @@ def boxer_quality_score(
     return float(np.clip(quality, 0.0, 1.0))
 
 
+def sanitize_score(score: float, fallback: float = 0.05) -> Tuple[float, bool]:
+    """Return a finite JSON-safe score, falling back to a quality estimate."""
+    try:
+        score_f = float(score)
+    except (TypeError, ValueError):
+        score_f = float("nan")
+    if math.isfinite(score_f):
+        return score_f, False
+
+    try:
+        fallback_f = float(fallback)
+    except (TypeError, ValueError):
+        fallback_f = 0.05
+    if not math.isfinite(fallback_f):
+        fallback_f = 0.05
+    return float(np.clip(fallback_f, 0.0, 1.0)), True
+
+
 def obb_to_omni3d_fields(
     obb: ObbTW,
     img_info: dict,
@@ -1705,7 +1726,7 @@ def obb_to_omni3d_fields(
     dims = boxer_dims_to_omni(dims_object_xyz).astype(np.float32)
     r_world_obj = obb.T_world_object.R.detach().cpu().numpy().astype(np.float32)
     r_cam_obj = transform_rotation_world_to_cam(r_world_obj, r_wc)
-    score = float(obb.prob.squeeze(-1).item())
+    raw_score = float(obb.prob.squeeze(-1).item())
 
     center_cam, dims, corners_cam, adjust_metrics = apply_original_prior_ground_adjustments(
         entry.label,
@@ -1782,7 +1803,7 @@ def obb_to_omni3d_fields(
     proj_ok = args.no_projection_gate or proj_iou >= args.min_proj_iou
     depth_gate_ok = args.no_depth_gate or depth_ok
     quality = boxer_quality_score(
-        score,
+        raw_score,
         proj_iou,
         depth_support,
         depth_rel_err,
@@ -1790,6 +1811,7 @@ def obb_to_omni3d_fields(
         ground_metrics,
         args,
     )
+    score, score_repaired = sanitize_score(raw_score, quality)
     quality_threshold = classwise_quality_threshold(entry.label, args)
     quality_ok = (not args.classwise_quality_gate) or quality >= quality_threshold
     valid = bool(
@@ -1816,6 +1838,7 @@ def obb_to_omni3d_fields(
         "depth_median": float(depth_median) if math.isfinite(depth_median) else -1.0,
         "depth_value_source": depth_value_source,
         "score": score,
+        "score_repaired": bool(score_repaired),
         "quality_ok": bool(quality_ok),
         "boxer_quality": float(quality),
         "boxer_quality_threshold": float(quality_threshold),
@@ -1843,6 +1866,7 @@ def obb_to_omni3d_fields(
         "lidar_pts": int(entry.ann.get("lidar_pts", -1)),
         "depth_error": float(depth_rel_err) if math.isfinite(depth_rel_err) else -1.0,
         "score": score,
+        "boxer_score_repaired": bool(score_repaired),
         "boxer_projection_iou": float(proj_iou),
         "boxer_depth_support": float(depth_support),
         "boxer_depth_rel_error": float(depth_rel_err)
@@ -1898,6 +1922,8 @@ def update_stats(stats: dict, metrics: dict, reason_prefix: str = ""):
         stats["depth_gate_mask"] += 1
     elif depth_source == "bbox":
         stats["depth_gate_bbox"] += 1
+    if metrics.get("score_repaired", False):
+        stats["score_repaired"] += 1
     if metrics["valid"]:
         stats["valid3d"] += 1
         return
@@ -2155,6 +2181,7 @@ def main() -> None:
         "depth_refined": 0,
         "depth_gate_mask": 0,
         "depth_gate_bbox": 0,
+        "score_repaired": 0,
         "min_proj_iou_threshold": args.min_proj_iou,
         "thresh3d": args.thresh3d,
         "prior_min_ratio": args.prior_min_ratio,
