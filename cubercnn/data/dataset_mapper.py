@@ -140,6 +140,11 @@ def annotations_to_instances(annos, image_size, unknown_categories):
     target.gt_boxes = Boxes([BoxMode.convert(obj["bbox"], obj["bbox_mode"], BoxMode.XYXY_ABS) for obj in annos])
     target.gt_boxes3D = torch.FloatTensor([anno['center_cam_proj'] + anno['dimensions'] + anno['center_cam'] for anno in annos])
     target.gt_poses = torch.FloatTensor([anno['pose'] for anno in annos])
+    if len(annos) > 0:
+        weights = [float(anno.get("pseudo_weight", 1.0)) for anno in annos]
+        target.gt_pseudo_weight = torch.FloatTensor(weights).clamp(0.05, 1.0)
+    else:
+        target.gt_pseudo_weight = torch.FloatTensor([])
     
     n = len(target.gt_classes)
 

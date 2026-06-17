@@ -304,6 +304,73 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--depth_refine_max_shift_ratio", type=float, default=0.25)
     parser.add_argument(
+        "--use_dfu_point_filter",
+        action="store_true",
+        help=(
+            "Build a DFU3D-style robust pseudo-point cluster from SAM mask/bbox "
+            "and metric depth, then use it to refine Boxer center/dims and gate support."
+        ),
+    )
+    parser.add_argument(
+        "--dfu_require_points",
+        action="store_true",
+        help="Reject predictions when DFU point filtering cannot produce enough points.",
+    )
+    parser.add_argument("--dfu_min_points", type=int, default=24)
+    parser.add_argument("--dfu_depth_percentile_low", type=float, default=10.0)
+    parser.add_argument("--dfu_depth_percentile_high", type=float, default=90.0)
+    parser.add_argument("--dfu_mad_scale", type=float, default=3.0)
+    parser.add_argument("--dfu_min_depth_window", type=float, default=0.05)
+    parser.add_argument(
+        "--dfu_use_radius_outlier",
+        action="store_true",
+        help=(
+            "Apply DFU3D/Open3D-style remove_radius_outlier on filtered "
+            "pseudo-points before center/dim refinement."
+        ),
+    )
+    parser.add_argument(
+        "--dfu_radius_backend",
+        choices=["auto", "torch_cuda", "open3d_cuda", "open3d_cpu", "scipy"],
+        default="auto",
+        help=(
+            "Backend for DFU radius outlier filtering. auto tries PyTorch CUDA, "
+            "then Open3D tensor CUDA, then Open3D CPU, then scipy."
+        ),
+    )
+    parser.add_argument("--dfu_radius_nb_points", type=int, default=10)
+    parser.add_argument("--dfu_radius", type=float, default=0.45)
+    parser.add_argument("--dfu_radius_chunk_size", type=int, default=1024)
+    parser.add_argument("--dfu_downsample_every", type=int, default=1)
+    parser.add_argument(
+        "--dfu_radius_strict",
+        action="store_true",
+        help="Reject/fail DFU points when radius filtering leaves too few points.",
+    )
+    parser.add_argument("--dfu_xy_blend", type=float, default=0.15)
+    parser.add_argument("--dfu_z_blend", type=float, default=0.55)
+    parser.add_argument("--dfu_max_center_shift_ratio", type=float, default=0.25)
+    parser.add_argument("--dfu_extent_percentile_low", type=float, default=5.0)
+    parser.add_argument("--dfu_extent_percentile_high", type=float, default=95.0)
+    parser.add_argument("--dfu_extent_scale", type=float, default=1.10)
+    parser.add_argument("--dfu_dim_blend", type=float, default=0.60)
+    parser.add_argument(
+        "--dfu_allow_dim_shrink",
+        action="store_true",
+        help="Allow DFU visible extent to shrink oversized Boxer dimensions.",
+    )
+    parser.add_argument("--dfu_shrink_trigger", type=float, default=2.75)
+    parser.add_argument("--dfu_box_margin", type=float, default=0.15)
+    parser.add_argument(
+        "--dfu_min_box_support",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, require this fraction of DFU filtered points to fall inside "
+            "the final 3D box plus margin."
+        ),
+    )
+    parser.add_argument(
         "--classwise_quality_gate",
         action="store_true",
         help="Apply a Boxer++ quality threshold after projection/depth/prior/ground gates.",
@@ -1059,7 +1126,7 @@ def build_original_gsam_entries(
     width = int(img_info["width"])
     height = int(img_info["height"])
     masks = None
-    if args.use_mask_depth_gate or args.boxer_refine_with_depth:
+    if args.use_mask_depth_gate or args.boxer_refine_with_depth or args.use_dfu_point_filter:
         masks = load_original_instance_masks(
             args.original_pseudo_root, dataset_name, split, img_id
         )
@@ -1640,6 +1707,433 @@ def refine_center_z_with_depth(
     return center.astype(np.float32), corners.astype(np.float32), metrics
 
 
+def clamp_percentile_pair(low: float, high: float) -> Tuple[float, float]:
+    low_f = float(np.clip(low, 0.0, 100.0))
+    high_f = float(np.clip(high, 0.0, 100.0))
+    if high_f <= low_f:
+        return 0.0, 100.0
+    return low_f, high_f
+
+
+def entry_region_mask(
+    depth_np: np.ndarray,
+    bbox_xyxy: Sequence[float],
+    mask: Optional[np.ndarray],
+    min_pixels: int,
+) -> Tuple[Optional[np.ndarray], str, int]:
+    h, w = depth_np.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    ix1 = max(0, min(w - 1, int(math.floor(x1))))
+    iy1 = max(0, min(h - 1, int(math.floor(y1))))
+    ix2 = max(0, min(w, int(math.ceil(x2))))
+    iy2 = max(0, min(h, int(math.ceil(y2))))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return None, "empty_box", 0
+
+    roi = np.zeros((h, w), dtype=bool)
+    roi[iy1:iy2, ix1:ix2] = True
+    mask_np = resize_bool_mask(mask, h, w) if mask is not None else None
+    if mask_np is not None and int(mask_np.sum()) > 0:
+        region = roi & mask_np
+        if int(region.sum()) >= min_pixels:
+            return region, "mask", int(region.sum())
+    return roi, "bbox", int(roi.sum())
+
+
+def build_dfu_filtered_points(
+    depth_np: Optional[np.ndarray],
+    bbox_xyxy: Sequence[float],
+    mask: Optional[np.ndarray],
+    K: Sequence[Sequence[float]],
+    args: argparse.Namespace,
+) -> Tuple[Optional[np.ndarray], dict]:
+    metrics = {
+        "dfu_enabled": bool(args.use_dfu_point_filter),
+        "dfu_available": False,
+        "dfu_ok": not args.dfu_require_points,
+        "dfu_source": "disabled",
+        "dfu_raw_pixels": 0,
+        "dfu_filtered_points": 0,
+        "dfu_depth_median": -1.0,
+        "dfu_depth_low": -1.0,
+        "dfu_depth_high": -1.0,
+    }
+    if not args.use_dfu_point_filter:
+        return None, metrics
+    if depth_np is None:
+        metrics["dfu_source"] = "missing_depth"
+        return None, metrics
+
+    depth = np.asarray(depth_np, dtype=np.float32)
+    if depth.ndim != 2:
+        metrics["dfu_source"] = "invalid_depth"
+        return None, metrics
+
+    region, source, region_pixels = entry_region_mask(
+        depth,
+        bbox_xyxy,
+        mask,
+        max(1, int(args.dfu_min_points)),
+    )
+    metrics["dfu_source"] = source
+    metrics["dfu_region_pixels"] = int(region_pixels)
+    if region is None:
+        return None, metrics
+
+    valid = region & np.isfinite(depth) & (depth > 0)
+    raw_pixels = int(valid.sum())
+    metrics["dfu_raw_pixels"] = raw_pixels
+    if raw_pixels < int(args.dfu_min_points):
+        metrics["dfu_source"] = f"{source}_too_few_depth"
+        return None, metrics
+
+    vals = depth[valid].astype(np.float32)
+    p_low, p_high = clamp_percentile_pair(
+        args.dfu_depth_percentile_low,
+        args.dfu_depth_percentile_high,
+    )
+    lo, hi = np.percentile(vals, [p_low, p_high])
+    keep = valid & (depth >= float(lo)) & (depth <= float(hi))
+    vals_pct = depth[keep].astype(np.float32)
+    if vals_pct.size < int(args.dfu_min_points):
+        keep = valid
+        vals_pct = vals
+
+    median = float(np.median(vals_pct))
+    mad = float(np.median(np.abs(vals_pct - median)))
+    robust_sigma = 1.4826 * mad
+    depth_window = max(
+        float(args.dfu_min_depth_window),
+        float(args.dfu_mad_scale) * robust_sigma,
+    )
+    keep_mad = keep & (np.abs(depth - median) <= depth_window)
+    vals_filtered = depth[keep_mad].astype(np.float32)
+    if vals_filtered.size >= int(args.dfu_min_points):
+        keep = keep_mad
+    else:
+        vals_filtered = vals_pct
+
+    vs, us = np.nonzero(keep)
+    if len(us) < int(args.dfu_min_points):
+        metrics["dfu_source"] = f"{source}_filter_too_few"
+        return None, metrics
+
+    uv_depth = np.stack([us.astype(np.float32), vs.astype(np.float32), depth[keep]], axis=1)
+    points = project_image_to_cam(uv_depth, np.asarray(K, dtype=np.float64)).astype(np.float32)
+    finite = np.all(np.isfinite(points), axis=1) & (points[:, 2] > 0)
+    points = points[finite]
+    if points.shape[0] < int(args.dfu_min_points):
+        metrics["dfu_source"] = f"{source}_points_too_few"
+        return None, metrics
+
+    points, radius_metrics = dfu_radius_outlier_filter_points(points, args)
+    metrics.update(radius_metrics)
+    if points.shape[0] < int(args.dfu_min_points):
+        metrics["dfu_source"] = f"{source}_radius_too_few"
+        metrics["dfu_ok"] = not args.dfu_require_points and not args.dfu_radius_strict
+        return None, metrics
+
+    depth_vals = points[:, 2]
+    metrics.update(
+        {
+            "dfu_available": True,
+            "dfu_ok": bool(metrics.get("dfu_radius_ok", True)),
+            "dfu_source": source,
+            "dfu_filtered_points": int(points.shape[0]),
+            "dfu_depth_median": float(np.median(depth_vals)),
+            "dfu_depth_low": float(np.min(depth_vals)),
+            "dfu_depth_high": float(np.max(depth_vals)),
+            "dfu_depth_window": float(depth_window),
+        }
+    )
+    return points, metrics
+
+
+def dfu_radius_outlier_filter_points(
+    points: np.ndarray,
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, dict]:
+    metrics = {
+        "dfu_radius_enabled": bool(args.dfu_use_radius_outlier),
+        "dfu_radius_backend_requested": str(getattr(args, "dfu_radius_backend", "auto")),
+        "dfu_radius_backend": "disabled",
+        "dfu_radius_input_points": int(points.shape[0]),
+        "dfu_radius_output_points": int(points.shape[0]),
+        "dfu_radius_ok": True,
+    }
+    if not args.dfu_use_radius_outlier:
+        return points, metrics
+
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    every_k = max(1, int(args.dfu_downsample_every))
+    if every_k > 1:
+        pts = pts[::every_k]
+    metrics["dfu_radius_downsample_every"] = int(every_k)
+    metrics["dfu_radius_downsampled_points"] = int(pts.shape[0])
+
+    if pts.shape[0] < int(args.dfu_min_points):
+        metrics.update(
+            {
+                "dfu_radius_backend": "too_few_before_radius",
+                "dfu_radius_output_points": int(pts.shape[0]),
+                "dfu_radius_ok": not args.dfu_radius_strict,
+            }
+        )
+        return (pts if args.dfu_radius_strict else points), metrics
+
+    nb_points = max(1, int(args.dfu_radius_nb_points))
+    radius = max(1e-6, float(args.dfu_radius))
+    filtered = None
+    backend = "none"
+    requested_backend = str(getattr(args, "dfu_radius_backend", "auto"))
+
+    if requested_backend in ("auto", "torch_cuda"):
+        try:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+                pts_t = torch.from_numpy(pts.astype(np.float32)).to(device)
+                radius_sq = float(radius * radius)
+                chunk = int(getattr(args, "dfu_radius_chunk_size", 1024))
+                chunk = max(128, chunk)
+                counts = []
+                with torch.no_grad():
+                    for start in range(0, pts_t.shape[0], chunk):
+                        q = pts_t[start : start + chunk]
+                        dist_sq = torch.cdist(q, pts_t, p=2).square()
+                        counts.append((dist_sq <= radius_sq).sum(dim=1).cpu())
+                    keep = torch.cat(counts, dim=0).numpy() >= nb_points
+                filtered = pts[keep]
+                backend = "torch_cuda"
+        except Exception as exc:
+            metrics["dfu_radius_torch_cuda_error"] = str(exc)[:240]
+
+    if filtered is None and requested_backend in ("auto", "open3d_cuda"):
+        try:
+            import open3d as o3d  # type: ignore
+
+            if bool(o3d.core.cuda.is_available()):
+                gpu_idx = max(0, int(getattr(args, "gpu", 0)))
+                device = o3d.core.Device(f"CUDA:{gpu_idx}")
+                pcd = o3d.t.geometry.PointCloud(device)
+                pcd.point["positions"] = o3d.core.Tensor(
+                    pts.astype(np.float32),
+                    dtype=o3d.core.Dtype.Float32,
+                    device=device,
+                )
+                cl, _ = pcd.remove_radius_outliers(
+                    nb_points=nb_points,
+                    search_radius=radius,
+                )
+                filtered = cl.point["positions"].cpu().numpy().astype(np.float32)
+                backend = "open3d_cuda"
+        except Exception as exc:
+            metrics["dfu_radius_cuda_error"] = str(exc)[:240]
+
+    if filtered is None and requested_backend in ("auto", "open3d_cpu"):
+        try:
+            import open3d as o3d  # type: ignore
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+            cl, _ = pcd.remove_radius_outlier(nb_points=nb_points, radius=radius)
+            filtered = np.asarray(cl.points, dtype=np.float32)
+            backend = "open3d_cpu"
+        except Exception as exc:
+            metrics["dfu_radius_open3d_cpu_error"] = str(exc)[:240]
+
+    if filtered is None and requested_backend in ("auto", "scipy"):
+        try:
+            from scipy.spatial import cKDTree  # type: ignore
+
+            tree = cKDTree(pts)
+            try:
+                counts = tree.query_ball_point(pts, r=radius, return_length=True)
+            except TypeError:
+                counts = np.asarray([len(x) for x in tree.query_ball_point(pts, r=radius)])
+            keep = np.asarray(counts) >= nb_points
+            filtered = pts[keep]
+            backend = "scipy_ckdtree"
+        except Exception as exc:
+            metrics["dfu_radius_scipy_error"] = str(exc)[:240]
+            filtered = pts
+            backend = "unavailable"
+
+    if filtered is None:
+        filtered = pts
+    metrics.update(
+        {
+            "dfu_radius_backend": backend,
+            "dfu_radius_output_points": int(filtered.shape[0]),
+            "dfu_radius_nb_points": int(nb_points),
+            "dfu_radius": float(radius),
+        }
+    )
+
+    if filtered.shape[0] < int(args.dfu_min_points):
+        metrics["dfu_radius_ok"] = not args.dfu_radius_strict
+        if args.dfu_radius_strict:
+            return filtered.astype(np.float32), metrics
+        return points, metrics
+
+    return filtered.astype(np.float32), metrics
+
+
+def point_support_inside_box(
+    points_cam: np.ndarray,
+    center_cam: np.ndarray,
+    dims_omni: np.ndarray,
+    r_cam_obj: np.ndarray,
+    margin: float,
+) -> Tuple[float, int]:
+    points = np.asarray(points_cam, dtype=np.float64).reshape(-1, 3)
+    if points.size == 0:
+        return 0.0, 0
+    center = np.asarray(center_cam, dtype=np.float64).reshape(3)
+    dims_obj = omni_dims_to_object_xyz(dims_omni)
+    r_cam_obj = np.asarray(r_cam_obj, dtype=np.float64).reshape(3, 3)
+    local = (points - center.reshape(1, 3)) @ r_cam_obj
+    half = dims_obj.reshape(1, 3) * 0.5 + float(max(margin, 0.0))
+    inside = np.all(np.abs(local) <= half, axis=1)
+    return float(np.mean(inside)), int(np.sum(inside))
+
+
+def apply_dfu_point_refinement(
+    label: str,
+    center_cam: np.ndarray,
+    dims_omni: np.ndarray,
+    r_cam_obj: np.ndarray,
+    depth_np: Optional[np.ndarray],
+    entry: Box2DEntry,
+    K: Sequence[Sequence[float]],
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    center = np.asarray(center_cam, dtype=np.float64).reshape(3).copy()
+    dims = np.asarray(dims_omni, dtype=np.float64).reshape(3).copy()
+    r_cam_obj_np = np.asarray(r_cam_obj, dtype=np.float64).reshape(3, 3)
+    corners = cubercnn_box_corners(center, dims, r_cam_obj_np)
+    raw_center = center.copy()
+    raw_dims = dims.copy()
+
+    points, metrics = build_dfu_filtered_points(
+        depth_np,
+        entry.bbox_xyxy,
+        entry.mask,
+        K,
+        args,
+    )
+    metrics.update(
+        {
+            "dfu_center_refined": False,
+            "dfu_dims_refined": False,
+            "dfu_center_shift_norm": 0.0,
+            "dfu_box_support": -1.0,
+            "dfu_box_support_points": 0,
+        }
+    )
+    if not args.use_dfu_point_filter:
+        return center.astype(np.float32), dims.astype(np.float32), corners.astype(np.float32), metrics
+    if points is None:
+        return center.astype(np.float32), dims.astype(np.float32), corners.astype(np.float32), metrics
+
+    point_median = np.median(points.astype(np.float64), axis=0)
+    if np.all(np.isfinite(point_median)) and np.isfinite(center[2]) and center[2] > 1e-4:
+        target = center.copy()
+        z_min = float(np.min(corners[:, 2]))
+        front_offset = max(0.0, float(center[2] - z_min))
+        target[0] = point_median[0]
+        target[1] = point_median[1]
+        target[2] = point_median[2] + front_offset
+        blend = np.array(
+            [
+                float(np.clip(args.dfu_xy_blend, 0.0, 1.0)),
+                float(np.clip(args.dfu_xy_blend, 0.0, 1.0)),
+                float(np.clip(args.dfu_z_blend, 0.0, 1.0)),
+            ],
+            dtype=np.float64,
+        )
+        delta = (target - center) * blend
+        max_shift = (
+            max(0.0, float(args.dfu_max_center_shift_ratio))
+            * max(float(center[2]), float(np.linalg.norm(dims)), 1e-3)
+        )
+        delta_norm = float(np.linalg.norm(delta))
+        if max_shift > 0 and delta_norm > max_shift:
+            delta = delta * (max_shift / max(delta_norm, 1e-8))
+            delta_norm = max_shift
+        if delta_norm >= 1e-4:
+            center = center + delta
+            metrics.update(
+                {
+                    "dfu_center_refined": True,
+                    "dfu_center_shift_norm": float(delta_norm),
+                    "dfu_center_target": [float(x) for x in target.tolist()],
+                    "dfu_center_raw": [float(x) for x in raw_center.tolist()],
+                }
+            )
+
+    corners = cubercnn_box_corners(center, dims, r_cam_obj_np)
+
+    local = (points.astype(np.float64) - center.reshape(1, 3)) @ r_cam_obj_np
+    p_low, p_high = clamp_percentile_pair(
+        args.dfu_extent_percentile_low,
+        args.dfu_extent_percentile_high,
+    )
+    local_low, local_high = np.percentile(local, [p_low, p_high], axis=0)
+    visible_extent_obj = np.maximum(local_high - local_low, float(args.min_dimension))
+    current_obj = omni_dims_to_object_xyz(dims)
+    desired_obj = np.maximum(
+        current_obj,
+        visible_extent_obj * max(float(args.dfu_extent_scale), 1.0),
+    )
+    if args.dfu_allow_dim_shrink:
+        shrink_trigger = max(float(args.dfu_shrink_trigger), 1.05)
+        visible_target = np.maximum(
+            visible_extent_obj * max(float(args.dfu_extent_scale), 1.0),
+            float(args.min_dimension),
+        )
+        shrink_mask = current_obj > (visible_target * shrink_trigger)
+        desired_obj = np.where(shrink_mask, visible_target, desired_obj)
+    dim_blend = float(np.clip(args.dfu_dim_blend, 0.0, 1.0))
+    refined_obj = current_obj + (desired_obj - current_obj) * dim_blend
+    refined_obj = np.clip(refined_obj, float(args.min_dimension), float(args.max_dimension))
+    refined_dims = boxer_dims_to_omni(refined_obj)
+    if np.all(np.isfinite(refined_dims)) and float(np.linalg.norm(refined_dims - dims)) >= 1e-4:
+        dims = refined_dims
+        corners = cubercnn_box_corners(center, dims, r_cam_obj_np)
+        metrics.update(
+            {
+                "dfu_dims_refined": True,
+                "dfu_dims_raw": [float(x) for x in raw_dims.tolist()],
+                "dfu_visible_extent_object_xyz": [
+                    float(x) for x in visible_extent_obj.tolist()
+                ],
+            }
+        )
+
+    support, support_points = point_support_inside_box(
+        points,
+        center,
+        dims,
+        r_cam_obj_np,
+        args.dfu_box_margin,
+    )
+    dfu_ok = bool(
+        support >= float(args.dfu_min_box_support)
+        if float(args.dfu_min_box_support) > 0
+        else True
+    )
+    metrics.update(
+        {
+            "dfu_ok": dfu_ok,
+            "dfu_box_support": float(support),
+            "dfu_box_support_points": int(support_points),
+            "dfu_center_final": [float(x) for x in center.tolist()],
+            "dfu_dimensions_final": [float(x) for x in dims.tolist()],
+        }
+    )
+    return center.astype(np.float32), dims.astype(np.float32), corners.astype(np.float32), metrics
+
+
 def classwise_quality_threshold(label: str, args: argparse.Namespace) -> float:
     label_norm = str(label).lower()
     if label_norm in THIN_OR_WALL_CLASSES:
@@ -1750,6 +2244,26 @@ def obb_to_omni3d_fields(
             entry,
             args,
         )
+    dfu_metrics = {
+        "dfu_enabled": bool(args.use_dfu_point_filter),
+        "dfu_available": False,
+        "dfu_ok": not args.dfu_require_points,
+        "dfu_center_refined": False,
+        "dfu_dims_refined": False,
+        "dfu_box_support": -1.0,
+        "dfu_source": "disabled",
+    }
+    if args.use_dfu_point_filter:
+        center_cam, dims, corners_cam, dfu_metrics = apply_dfu_point_refinement(
+            entry.label,
+            center_cam,
+            dims,
+            r_cam_obj,
+            depth_np,
+            entry,
+            img_info["K"],
+            args,
+        )
 
     width = int(img_info["width"])
     height = int(img_info["height"])
@@ -1802,10 +2316,13 @@ def obb_to_omni3d_fields(
 
     proj_ok = args.no_projection_gate or proj_iou >= args.min_proj_iou
     depth_gate_ok = args.no_depth_gate or depth_ok
+    quality_depth_support = depth_support
+    if dfu_metrics.get("dfu_available") and float(dfu_metrics.get("dfu_box_support", -1.0)) >= 0:
+        quality_depth_support = max(float(depth_support), float(dfu_metrics["dfu_box_support"]))
     quality = boxer_quality_score(
         raw_score,
         proj_iou,
-        depth_support,
+        quality_depth_support,
         depth_rel_err,
         prior_metrics,
         ground_metrics,
@@ -1821,6 +2338,7 @@ def obb_to_omni3d_fields(
         and ground_ok
         and proj_ok
         and depth_gate_ok
+        and bool(dfu_metrics.get("dfu_ok", True))
         and quality_ok
     )
 
@@ -1845,6 +2363,7 @@ def obb_to_omni3d_fields(
         "nms_suppressed": False,
         **adjust_metrics,
         **depth_refine_metrics,
+        **dfu_metrics,
         **prior_metrics,
         **ground_metrics,
     }
@@ -1883,6 +2402,27 @@ def obb_to_omni3d_fields(
         "boxer_center_cam_raw": adjust_metrics["raw_center_cam"],
         "boxer_depth_refined": bool(depth_refine_metrics.get("depth_refined", False)),
         "boxer_depth_refine_shift": float(depth_refine_metrics.get("depth_refine_shift", 0.0)),
+        "boxer_dfu_enabled": bool(dfu_metrics.get("dfu_enabled", False)),
+        "boxer_dfu_available": bool(dfu_metrics.get("dfu_available", False)),
+        "boxer_dfu_ok": bool(dfu_metrics.get("dfu_ok", True)),
+        "boxer_dfu_source": str(dfu_metrics.get("dfu_source", "disabled")),
+        "boxer_dfu_raw_pixels": int(dfu_metrics.get("dfu_raw_pixels", 0)),
+        "boxer_dfu_filtered_points": int(dfu_metrics.get("dfu_filtered_points", 0)),
+        "boxer_dfu_box_support": float(dfu_metrics.get("dfu_box_support", -1.0)),
+        "boxer_dfu_center_refined": bool(dfu_metrics.get("dfu_center_refined", False)),
+        "boxer_dfu_dims_refined": bool(dfu_metrics.get("dfu_dims_refined", False)),
+        "boxer_dfu_center_shift_norm": float(
+            dfu_metrics.get("dfu_center_shift_norm", 0.0)
+        ),
+        "boxer_dfu_radius_enabled": bool(dfu_metrics.get("dfu_radius_enabled", False)),
+        "boxer_dfu_radius_backend": str(dfu_metrics.get("dfu_radius_backend", "disabled")),
+        "boxer_dfu_radius_input_points": int(
+            dfu_metrics.get("dfu_radius_input_points", 0)
+        ),
+        "boxer_dfu_radius_output_points": int(
+            dfu_metrics.get("dfu_radius_output_points", 0)
+        ),
+        "boxer_dfu_radius_ok": bool(dfu_metrics.get("dfu_radius_ok", True)),
         "boxer_prior_adjusted": bool(adjust_metrics["prior_adjusted"]),
         "boxer_prior_adjusted_axes": adjust_metrics["prior_adjusted_axes"],
         "boxer_ground_snapped": bool(adjust_metrics["ground_snapped"]),
@@ -1893,6 +2433,13 @@ def obb_to_omni3d_fields(
     if ground_metrics.get("ground_available"):
         fields["boxer_ground_min_corner_distance"] = float(
             ground_metrics.get("ground_min_corner_distance", -1.0)
+        )
+    if dfu_metrics.get("dfu_available"):
+        fields["boxer_dfu_depth_median"] = float(dfu_metrics.get("dfu_depth_median", -1.0))
+        fields["boxer_dfu_depth_low"] = float(dfu_metrics.get("dfu_depth_low", -1.0))
+        fields["boxer_dfu_depth_high"] = float(dfu_metrics.get("dfu_depth_high", -1.0))
+        fields["boxer_dfu_visible_extent_object_xyz"] = dfu_metrics.get(
+            "dfu_visible_extent_object_xyz", []
         )
     return fields, metrics
 
@@ -1917,6 +2464,28 @@ def update_stats(stats: dict, metrics: dict, reason_prefix: str = ""):
         stats["ground_snapped"] += 1
     if metrics.get("depth_refined", False):
         stats["depth_refined"] += 1
+    if metrics.get("dfu_available", False):
+        stats["dfu_available"] += 1
+    if metrics.get("dfu_center_refined", False):
+        stats["dfu_center_refined"] += 1
+    if metrics.get("dfu_dims_refined", False):
+        stats["dfu_dims_refined"] += 1
+    if metrics.get("dfu_radius_enabled", False):
+        stats["dfu_radius_enabled"] += 1
+    if metrics.get("dfu_radius_backend") == "torch_cuda":
+        stats["dfu_radius_backend_torch_cuda"] += 1
+    elif metrics.get("dfu_radius_backend") == "open3d_cuda":
+        stats["dfu_radius_backend_open3d_cuda"] += 1
+    elif metrics.get("dfu_radius_backend") == "open3d_cpu":
+        stats["dfu_radius_backend_open3d"] += 1
+    elif metrics.get("dfu_radius_backend") == "scipy_ckdtree":
+        stats["dfu_radius_backend_scipy"] += 1
+    elif metrics.get("dfu_radius_backend") not in (None, "disabled"):
+        stats["dfu_radius_backend_other"] += 1
+    if metrics.get("dfu_source") == "mask":
+        stats["dfu_source_mask"] += 1
+    elif metrics.get("dfu_source") == "bbox":
+        stats["dfu_source_bbox"] += 1
     depth_source = metrics.get("depth_value_source")
     if depth_source == "mask":
         stats["depth_gate_mask"] += 1
@@ -1942,6 +2511,8 @@ def update_stats(stats: dict, metrics: dict, reason_prefix: str = ""):
         stats["reject_depth"] += 1
     if not metrics.get("quality_ok", True):
         stats["reject_quality"] += 1
+    if not metrics.get("dfu_ok", True):
+        stats["reject_dfu"] += 1
     if metrics.get("nms_suppressed", False):
         stats["reject_nms"] += 1
 
@@ -2172,6 +2743,7 @@ def main() -> None:
         "reject_projection": 0,
         "reject_depth": 0,
         "reject_quality": 0,
+        "reject_dfu": 0,
         "reject_nms": 0,
         "images_with_ground": 0,
         "images_missing_ground": 0,
@@ -2179,6 +2751,17 @@ def main() -> None:
         "prior_adjusted": 0,
         "ground_snapped": 0,
         "depth_refined": 0,
+        "dfu_available": 0,
+        "dfu_center_refined": 0,
+        "dfu_dims_refined": 0,
+        "dfu_radius_enabled": 0,
+        "dfu_radius_backend_open3d_cuda": 0,
+        "dfu_radius_backend_torch_cuda": 0,
+        "dfu_radius_backend_open3d": 0,
+        "dfu_radius_backend_scipy": 0,
+        "dfu_radius_backend_other": 0,
+        "dfu_source_mask": 0,
+        "dfu_source_bbox": 0,
         "depth_gate_mask": 0,
         "depth_gate_bbox": 0,
         "score_repaired": 0,
@@ -2192,6 +2775,16 @@ def main() -> None:
         "ground_snap_enabled": not args.no_ground_snap,
         "mask_depth_gate_enabled": bool(args.use_mask_depth_gate),
         "depth_refine_enabled": bool(args.boxer_refine_with_depth),
+        "dfu_point_filter_enabled": bool(args.use_dfu_point_filter),
+        "dfu_require_points": bool(args.dfu_require_points),
+        "dfu_min_points": args.dfu_min_points,
+        "dfu_min_box_support": args.dfu_min_box_support,
+        "dfu_use_radius_outlier": bool(args.dfu_use_radius_outlier),
+        "dfu_radius_backend": args.dfu_radius_backend,
+        "dfu_radius_nb_points": args.dfu_radius_nb_points,
+        "dfu_radius": args.dfu_radius,
+        "dfu_downsample_every": args.dfu_downsample_every,
+        "dfu_radius_strict": bool(args.dfu_radius_strict),
         "classwise_quality_gate_enabled": bool(args.classwise_quality_gate),
         "quality_threshold": args.quality_threshold,
         "thin_quality_threshold": args.thin_quality_threshold,
@@ -2377,6 +2970,12 @@ def main() -> None:
     output["info"]["boxer_ground_snap"] = not args.no_ground_snap
     output["info"]["boxer_mask_depth_gate"] = bool(args.use_mask_depth_gate)
     output["info"]["boxer_depth_refine"] = bool(args.boxer_refine_with_depth)
+    output["info"]["boxer_dfu_point_filter"] = bool(args.use_dfu_point_filter)
+    output["info"]["boxer_dfu_min_points"] = int(args.dfu_min_points)
+    output["info"]["boxer_dfu_min_box_support"] = float(args.dfu_min_box_support)
+    output["info"]["boxer_dfu_radius_outlier"] = bool(args.dfu_use_radius_outlier)
+    output["info"]["boxer_dfu_radius_nb_points"] = int(args.dfu_radius_nb_points)
+    output["info"]["boxer_dfu_radius"] = float(args.dfu_radius)
     output["info"]["boxer_classwise_quality_gate"] = bool(args.classwise_quality_gate)
     output["info"]["boxer_nms"] = bool(args.boxer_nms)
     output["info"]["boxer_source_json"] = os.path.abspath(args.json_file)

@@ -346,6 +346,10 @@ class ROIHeads3D(StandardROIHeads):
             box_classes = (torch.cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0))
             gt_boxes3D = torch.cat([p.gt_boxes3D for p in proposals], dim=0,)
             gt_poses = torch.cat([p.gt_poses for p in proposals], dim=0,)
+            if len(proposals) and proposals[0].has("gt_pseudo_weight"):
+                gt_pseudo_weight = torch.cat([p.gt_pseudo_weight for p in proposals], dim=0).to(gt_boxes3D.device)
+            else:
+                gt_pseudo_weight = torch.ones_like(box_classes, dtype=torch.float32, device=gt_boxes3D.device)
 
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
         
@@ -738,6 +742,24 @@ class ROIHeads3D(StandardROIHeads):
 
                 losses.update({prefix + 'uncert': self.use_confidence*self.safely_reduce_losses(cube_uncert.clone())})
                 storage.put_scalar(prefix + 'conf', torch.exp(-cube_uncert).mean().item(), smoothing_hint=False)
+
+            if gt_pseudo_weight.numel() > 0:
+                gt_pseudo_weight = gt_pseudo_weight.to(loss_dims.device).clamp(0.05, 1.0)
+                loss_dims = loss_dims * gt_pseudo_weight
+
+                if not cube_2d_deltas is None:
+                    loss_xy = loss_xy * gt_pseudo_weight
+
+                if loss_z is not None:
+                    loss_z = loss_z * gt_pseudo_weight
+
+                if loss_pose is not None:
+                    loss_pose = loss_pose * gt_pseudo_weight
+
+                if self.loss_w_joint > 0:
+                    loss_joint = loss_joint * gt_pseudo_weight
+
+                storage.put_scalar(prefix + 'pseudo_weight', gt_pseudo_weight.mean().item(), smoothing_hint=False)
 
             # store per batch loss stats temporarily
             self.batch_losses = [batch_losses.mean().item() for batch_losses in total_3D_loss_for_reporting.split(num_boxes_per_image)]
