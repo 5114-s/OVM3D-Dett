@@ -5,7 +5,7 @@ import numpy as np
 from detectron2.layers import ShapeSpec, batched_nms
 from detectron2.utils.visualizer import Visualizer
 from detectron2.data.detection_utils import convert_image_to_rgb
-from detectron2.structures import Instances
+from detectron2.structures import Instances, ImageList
 from detectron2.utils.events import get_event_storage
 from detectron2.data import MetadataCatalog
 
@@ -44,6 +44,7 @@ class RCNN3D_text(GeneralizedRCNN):
             return self.inference(batched_inputs, text_embeddings)
 
         images = self.preprocess_image(batched_inputs)
+        prompt_depth = self.preprocess_depth(batched_inputs)
 
         # scaling factor for the sample relative to its original scale
         # e.g., how much has the image been upsampled by? or downsampled?
@@ -63,7 +64,8 @@ class RCNN3D_text(GeneralizedRCNN):
         instances, detector_losses = self.roi_heads(
             images, features, text_embeddings, proposals, 
             Ks, im_scales_ratio, 
-            gt_instances
+            gt_instances,
+            prompt_depth=prompt_depth,
         )
 
         if self.vis_period > 0:
@@ -86,6 +88,7 @@ class RCNN3D_text(GeneralizedRCNN):
         assert not self.training
 
         images = self.preprocess_image(batched_inputs)
+        prompt_depth = self.preprocess_depth(batched_inputs)
 
         # scaling factor for the sample relative to its original scale
         # e.g., how much has the image been upsampled by? or downsampled?
@@ -99,18 +102,31 @@ class RCNN3D_text(GeneralizedRCNN):
         # Pass oracle 2D boxes into the RoI heads
         if type(batched_inputs == list) and np.any(['oracle2D' in b for b in batched_inputs]):
             oracles = [b['oracle2D'] for b in batched_inputs]
-            results, _ = self.roi_heads(images, features, text_embeddings, oracles, Ks, im_scales_ratio, None)
+            results, _ = self.roi_heads(
+                images, features, text_embeddings, oracles, Ks, im_scales_ratio,
+                None, prompt_depth=prompt_depth,
+            )
         
         # normal inference
         else:
             proposals, _ = self.proposal_generator(images, features, None)
-            results, _ = self.roi_heads(images, features, text_embeddings, proposals, Ks, im_scales_ratio, None)
+            results, _ = self.roi_heads(
+                images, features, text_embeddings, proposals, Ks, im_scales_ratio,
+                None, prompt_depth=prompt_depth,
+            )
 
         if do_postprocess:
             assert not torch.jit.is_scripting(), "Scripting is not supported for postprocess."
             return GeneralizedRCNN._postprocess(results, batched_inputs, images.image_sizes)
         else:
             return results
+
+    def preprocess_depth(self, batched_inputs: List[Dict[str, torch.Tensor]]):
+        if len(batched_inputs) == 0 or "depth" not in batched_inputs[0]:
+            return None
+        depths = [x["depth"].to(self.device).float() for x in batched_inputs]
+        size_divisibility = getattr(self.backbone, "size_divisibility", 0)
+        return ImageList.from_tensors(depths, size_divisibility)
 
     def visualize_training(self, batched_inputs, proposals, instances):
         """

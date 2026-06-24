@@ -1,7 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import copy
+import os
 import torch
 import numpy as np
+import cv2
 from detectron2.structures import BoxMode, Keypoints
 from detectron2.data import detection_utils
 from detectron2.data import transforms as T
@@ -16,16 +18,26 @@ from detectron2.structures import (
 
 class DatasetMapper3D(DatasetMapper):
 
+    def __init__(self, cfg, is_train=True):
+        super().__init__(cfg, is_train=is_train)
+        self.use_depth = bool(getattr(cfg.INPUT, "USE_DEPTH", False))
+        self.depth_root = str(getattr(cfg.INPUT, "DEPTH_ROOT", ""))
+
     def __call__(self, dataset_dict):
         
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
         
         image = detection_utils.read_image(dataset_dict["file_name"], format=self.image_format)
         detection_utils.check_image_size(dataset_dict, image)
+        depth = self._load_depth(dataset_dict, image.shape[:2]) if self.use_depth else None
 
         aug_input = T.AugInput(image)
         transforms = self.augmentations(aug_input)
         image = aug_input.image
+        if depth is not None:
+            depth = transforms.apply_image(depth[:, :, None])[:, :, 0]
+            depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+            depth = np.maximum(depth, 0.0).astype(np.float32)
 
         image_shape = image.shape[:2]  # h, w
 
@@ -33,6 +45,8 @@ class DatasetMapper3D(DatasetMapper):
         # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
         # Therefore it's important to use torch.Tensor.
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        if depth is not None:
+            dataset_dict["depth"] = torch.as_tensor(np.ascontiguousarray(depth[None, :, :]))
 
         # no need for additoinal processing at inference
         if not self.is_train:
@@ -56,6 +70,67 @@ class DatasetMapper3D(DatasetMapper):
             dataset_dict["instances"] = detection_utils.filter_empty_instances(instances)
 
         return dataset_dict
+
+    def _load_depth(self, dataset_dict, image_shape):
+        candidates = []
+        for key in ("depth_file_name", "depth_path", "depth_file_path"):
+            path = dataset_dict.get(key)
+            if path:
+                candidates.append(path)
+
+        image_id = dataset_dict.get("image_id")
+        if image_id is not None and self.depth_root:
+            image_id = int(image_id)
+            root = self.depth_root
+            candidates.extend([
+                os.path.join(root, f"{image_id}.npy"),
+                os.path.join(root, "depth", f"{image_id}.npy"),
+                os.path.join(root, "train", "depth", f"{image_id}.npy"),
+                os.path.join(root, "val", "depth", f"{image_id}.npy"),
+                os.path.join(root, "SUNRGBD", "train", "depth", f"{image_id}.npy"),
+                os.path.join(root, "SUNRGBD", "val", "depth", f"{image_id}.npy"),
+            ])
+
+        file_name = dataset_dict.get("file_name", "")
+        if "/image/" in file_name:
+            candidates.extend([
+                file_name.replace("/image/", "/depth/").replace(".jpg", ".png"),
+                file_name.replace("/image/", "/depth_bfx/").replace(".jpg", ".png"),
+            ])
+
+        for path in candidates:
+            if not path:
+                continue
+            path = os.path.expanduser(path)
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            if not os.path.exists(path):
+                continue
+
+            depth = self._read_depth_path(path)
+            if depth is None:
+                continue
+            if depth.ndim != 2:
+                continue
+            if depth.shape[:2] != tuple(image_shape):
+                depth = cv2.resize(
+                    depth,
+                    (int(image_shape[1]), int(image_shape[0])),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            return depth.astype(np.float32)
+
+        return None
+
+    def _read_depth_path(self, path):
+        if path.lower().endswith(".npy"):
+            depth = np.load(path).astype(np.float32)
+        else:
+            depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                return None
+            depth = depth.astype(np.float32) / 8000.0
+        return np.squeeze(depth)
 
 '''
 Cached for mirroring annotations

@@ -28,6 +28,73 @@ logger = logging.getLogger(__name__)
 E_CONSTANT = 2.71828183
 SQRT_2_CONSTANT = 1.41421356
 
+def depth_to_point_map(depth, Ks_scaled):
+    if depth is None:
+        return None
+
+    if depth.dim() == 3:
+        depth = depth.unsqueeze(1)
+    if depth.size(1) != 1:
+        depth = depth[:, :1]
+
+    depth = depth.float()
+    b, _, h, w = depth.shape
+    device = depth.device
+    dtype = depth.dtype
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    z = depth[:, 0]
+    fx = Ks_scaled[:, 0, 0].view(b, 1, 1).clamp(min=1e-6)
+    fy = Ks_scaled[:, 1, 1].view(b, 1, 1).clamp(min=1e-6)
+    cx = Ks_scaled[:, 0, 2].view(b, 1, 1)
+    cy = Ks_scaled[:, 1, 2].view(b, 1, 1)
+
+    x = (xs.unsqueeze(0) - cx) * z / fx
+    y = (ys.unsqueeze(0) - cy) * z / fy
+    point_map = torch.stack((x, y, z), dim=1)
+    valid = torch.isfinite(point_map).all(dim=1, keepdim=True) & (z.unsqueeze(1) > 0)
+    return torch.where(valid, point_map, torch.zeros_like(point_map))
+
+
+class DepthAwareROIPooler(nn.Module):
+    def __init__(
+        self,
+        output_size,
+        scales,
+        sampling_ratio,
+        pooler_type,
+        out_channels,
+        adapter_scale=1.0,
+    ):
+        super().__init__()
+        self.feature_pooler = ROIPooler(
+            output_size=output_size,
+            scales=scales,
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type,
+        )
+        self.point_pooler = ROIPooler(
+            output_size=output_size,
+            scales=(1.0,),
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type,
+        )
+        self.point_adapter = nn.Conv2d(3, out_channels, kernel_size=1)
+        nn.init.constant_(self.point_adapter.weight, 0.0)
+        nn.init.constant_(self.point_adapter.bias, 0.0)
+        self.adapter_scale = float(adapter_scale)
+
+    def forward(self, features, boxes, point_map=None):
+        roi_features = self.feature_pooler(features, boxes)
+        if point_map is None or sum(len(boxes_i) for boxes_i in boxes) == 0:
+            return roi_features
+        point_features = self.point_pooler([point_map], boxes)
+        return roi_features + self.adapter_scale * self.point_adapter(point_features)
+
+
 def build_roi_heads(cfg, input_shape, priors=None):
     """
     Build ROIHeads defined by `cfg.MODEL.ROI_HEADS.NAME`.
@@ -67,11 +134,23 @@ class ROIHeads3D_Text(StandardROIHeads):
         allocentric_pose=None,
         chamfer_pose=None,
         scale_roi_boxes=None,
+        use_depth_roi=None,
+        use_pseudo_weight=None,
+        use_depth_consistency_loss=None,
+        loss_w_depth_consistency=None,
+        depth_consistency_min_pixels=None,
+        depth_consistency_center_crop=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.scale_roi_boxes = scale_roi_boxes
+        self.use_depth_roi = bool(use_depth_roi)
+        self.use_pseudo_weight = bool(use_pseudo_weight)
+        self.use_depth_consistency_loss = bool(use_depth_consistency_loss)
+        self.loss_w_depth_consistency = float(loss_w_depth_consistency or 0.0)
+        self.depth_consistency_min_pixels = int(depth_consistency_min_pixels or 16)
+        self.depth_consistency_center_crop = float(depth_consistency_center_crop or 1.0)
 
         # rotation settings
         self.allocentric_pose = allocentric_pose
@@ -163,14 +242,25 @@ class ROIHeads3D_Text(StandardROIHeads):
         pooler_sampling_ratio = cfg.MODEL.ROI_CUBE_HEAD.POOLER_SAMPLING_RATIO
         pooler_type = cfg.MODEL.ROI_CUBE_HEAD.POOLER_TYPE
 
-        cube_pooler = ROIPooler(
-            output_size=pooler_resolution,
-            scales=pooler_scales,
-            sampling_ratio=pooler_sampling_ratio,
-            pooler_type=pooler_type,
-        )
-
         in_channels = [input_shape[f].channels for f in in_features][0]
+        use_depth_roi = bool(cfg.INPUT.USE_DEPTH and cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_ROI)
+        if use_depth_roi:
+            cube_pooler = DepthAwareROIPooler(
+                output_size=pooler_resolution,
+                scales=pooler_scales,
+                sampling_ratio=pooler_sampling_ratio,
+                pooler_type=pooler_type,
+                out_channels=in_channels,
+                adapter_scale=cfg.MODEL.ROI_CUBE_HEAD.DEPTH_ADAPTER_SCALE,
+            )
+        else:
+            cube_pooler = ROIPooler(
+                output_size=pooler_resolution,
+                scales=pooler_scales,
+                sampling_ratio=pooler_sampling_ratio,
+                pooler_type=pooler_type,
+            )
+
         shape = ShapeSpec(
             channels=in_channels, width=pooler_resolution, height=pooler_resolution
         )
@@ -201,10 +291,16 @@ class ROIHeads3D_Text(StandardROIHeads):
             'cluster_bins': cfg.MODEL.ROI_CUBE_HEAD.CLUSTER_BINS,
             'ignore_thresh': cfg.MODEL.RPN.IGNORE_THRESHOLD,
             'scale_roi_boxes': cfg.MODEL.ROI_CUBE_HEAD.SCALE_ROI_BOXES,
+            'use_depth_roi': use_depth_roi,
+            'use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT,
+            'use_depth_consistency_loss': cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_CONSISTENCY_LOSS,
+            'loss_w_depth_consistency': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DEPTH_CONSISTENCY,
+            'depth_consistency_min_pixels': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MIN_PIXELS,
+            'depth_consistency_center_crop': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP,
         }
 
 
-    def forward(self, images, features, text_embeddings, proposals, Ks, im_scales_ratio, targets=None):
+    def forward(self, images, features, text_embeddings, proposals, Ks, im_scales_ratio, targets=None, prompt_depth=None):
 
         im_dims = [image.shape[1:] for image in images]
 
@@ -219,7 +315,10 @@ class ROIHeads3D_Text(StandardROIHeads):
 
             losses = self._forward_box(features, text_embeddings, proposals)
             if self.loss_w_3d > 0:
-                instances_3d, losses_cube = self._forward_cube(features, proposals, Ks, im_dims, im_scales_ratio)
+                instances_3d, losses_cube = self._forward_cube(
+                    features, proposals, Ks, im_dims, im_scales_ratio,
+                    prompt_depth=prompt_depth,
+                )
                 losses.update(losses_cube)
 
             return instances_3d, losses
@@ -241,7 +340,10 @@ class ROIHeads3D_Text(StandardROIHeads):
                 pred_instances = self._forward_box(features, text_embeddings, proposals)
 
             if self.loss_w_3d > 0:
-                pred_instances = self._forward_cube(features, pred_instances, Ks, im_dims, im_scales_ratio)
+                pred_instances = self._forward_cube(
+                    features, pred_instances, Ks, im_dims, im_scales_ratio,
+                    prompt_depth=prompt_depth,
+                )
             return pred_instances, {}
     
 
@@ -322,7 +424,7 @@ class ROIHeads3D_Text(StandardROIHeads):
 
         return proposal_boxes_scaled
     
-    def _forward_cube(self, features, instances, Ks, im_current_dims, im_scales_ratio):
+    def _forward_cube(self, features, instances, Ks, im_current_dims, im_scales_ratio, prompt_depth=None):
         
         features = [features[f] for f in self.in_features]
 
@@ -341,10 +443,18 @@ class ROIHeads3D_Text(StandardROIHeads):
             proposals, _ = select_foreground_proposals(instances, self.num_classes)
             proposal_boxes = [x.proposal_boxes for x in proposals]
             pred_boxes = [x.pred_boxes for x in proposals]
+            depth_target_boxes = [
+                x.gt_boxes if x.has("gt_boxes") else x.proposal_boxes
+                for x in proposals
+            ]
 
             box_classes = (torch.cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0))
             gt_boxes3D = torch.cat([p.gt_boxes3D for p in proposals], dim=0,)
             gt_poses = torch.cat([p.gt_poses for p in proposals], dim=0,)
+            if len(proposals) and proposals[0].has("gt_pseudo_weight"):
+                gt_pseudo_weight = torch.cat([p.gt_pseudo_weight for p in proposals], dim=0).to(gt_boxes3D.device)
+            else:
+                gt_pseudo_weight = torch.ones_like(box_classes, dtype=torch.float32, device=gt_boxes3D.device)
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
 
         # eval on all instances
@@ -352,12 +462,24 @@ class ROIHeads3D_Text(StandardROIHeads):
             proposals = instances
             pred_boxes = [x.pred_boxes for x in instances]
             proposal_boxes = pred_boxes
+            depth_target_boxes = None
             box_classes = torch.cat([x.pred_classes for x in instances])
 
         proposal_boxes_scaled = self.scale_proposals(proposal_boxes)
 
         # forward features
-        cube_features = self.cube_pooler(features, proposal_boxes_scaled).flatten(1)
+        point_map = None
+        if self.use_depth_roi and prompt_depth is not None:
+            Ks_scaled_per_image = torch.stack([
+                Ks[i] / im_scales_ratio[i] for i in range(len(Ks))
+            ]).to(features[0].device)
+            Ks_scaled_per_image[:, -1, -1] = 1
+            point_map = depth_to_point_map(prompt_depth.tensor.to(features[0].device), Ks_scaled_per_image)
+
+        if self.use_depth_roi:
+            cube_features = self.cube_pooler(features, proposal_boxes_scaled, point_map).flatten(1)
+        else:
+            cube_features = self.cube_pooler(features, proposal_boxes_scaled).flatten(1)
 
         n = cube_features.shape[0]
         
@@ -735,6 +857,60 @@ class ROIHeads3D_Text(StandardROIHeads):
                 losses.update({prefix + 'uncert': self.use_confidence*self.safely_reduce_losses(cube_uncert.clone())})
                 storage.put_scalar(prefix + 'conf', torch.exp(-cube_uncert).mean().item(), smoothing_hint=False)
 
+            if self.use_pseudo_weight and gt_pseudo_weight.numel() > 0:
+                gt_pseudo_weight = gt_pseudo_weight.to(loss_dims.device).clamp(0.05, 1.0)
+                loss_dims = loss_dims * gt_pseudo_weight
+
+                if not cube_2d_deltas is None:
+                    loss_xy = loss_xy * gt_pseudo_weight
+
+                if loss_z is not None:
+                    loss_z = loss_z * gt_pseudo_weight
+
+                if loss_pose is not None:
+                    loss_pose = loss_pose * gt_pseudo_weight
+
+                if self.loss_w_joint > 0:
+                    loss_joint = loss_joint * gt_pseudo_weight
+
+                storage.put_scalar(prefix + 'pseudo_weight', gt_pseudo_weight.mean().item(), smoothing_hint=False)
+
+            if (
+                self.use_depth_consistency_loss
+                and self.loss_w_depth_consistency > 0
+                and prompt_depth is not None
+                and loss_z is not None
+            ):
+                depth_targets, depth_valid = self.depth_targets_from_boxes(
+                    prompt_depth.tensor.to(cube_z.device),
+                    depth_target_boxes,
+                    device=cube_z.device,
+                )
+                if depth_valid.numel() == cube_z.numel() and depth_valid.any():
+                    depth_targets = depth_targets[depth_valid].clamp(0.05, 80.0)
+                    pred_depth = cube_z[depth_valid].clamp(0.05, 80.0)
+                    loss_depth_consistency = F.smooth_l1_loss(
+                        torch.log(pred_depth),
+                        torch.log(depth_targets),
+                        reduction='none',
+                        beta=0.05,
+                    )
+                    if gt_pseudo_weight.numel() == cube_z.numel():
+                        depth_weight = gt_pseudo_weight.to(cube_z.device)[depth_valid].clamp(0.25, 1.0)
+                        loss_depth_consistency = loss_depth_consistency * (0.5 + 0.5 * depth_weight)
+                    losses.update({
+                        prefix + 'loss_depth_consistency': (
+                            self.safely_reduce_losses(loss_depth_consistency)
+                            * self.loss_w_depth_consistency
+                            * self.loss_w_3d
+                        )
+                    })
+                    storage.put_scalar(
+                        prefix + 'depth_consistency_valid',
+                        depth_valid.float().mean().item(),
+                        smoothing_hint=False,
+                    )
+
             # store per batch loss stats temporarily
             self.batch_losses = [batch_losses.mean().item() for batch_losses in total_3D_loss_for_reporting.split(num_boxes_per_image)]
             
@@ -923,6 +1099,72 @@ class ROIHeads3D_Text(StandardROIHeads):
         storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
 
         return proposals_with_gt
+
+    def depth_targets_from_boxes(self, depth, boxes_per_image, device=None):
+        if depth is None or boxes_per_image is None:
+            empty = torch.empty(0, device=device)
+            return empty, empty.bool()
+
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        if depth.size(1) != 1:
+            depth = depth[:, :1]
+
+        depth = depth.float()
+        device = device or depth.device
+        targets = []
+        valid = []
+        crop_ratio = min(max(self.depth_consistency_center_crop, 0.05), 1.0)
+
+        with torch.no_grad():
+            for img_idx, boxes in enumerate(boxes_per_image):
+                if img_idx >= depth.shape[0] or len(boxes) == 0:
+                    continue
+
+                depth_i = depth[img_idx, 0]
+                height, width = depth_i.shape[-2:]
+
+                for box in boxes.tensor.to(depth_i.device):
+                    x1, y1, x2, y2 = box.unbind()
+
+                    if crop_ratio < 1.0:
+                        cx = 0.5 * (x1 + x2)
+                        cy = 0.5 * (y1 + y2)
+                        bw = (x2 - x1).clamp(min=1.0) * crop_ratio
+                        bh = (y2 - y1).clamp(min=1.0) * crop_ratio
+                        x1 = cx - 0.5 * bw
+                        x2 = cx + 0.5 * bw
+                        y1 = cy - 0.5 * bh
+                        y2 = cy + 0.5 * bh
+
+                    xi1 = int(torch.floor(x1).clamp(0, max(width - 1, 0)).item())
+                    yi1 = int(torch.floor(y1).clamp(0, max(height - 1, 0)).item())
+                    xi2 = int(torch.ceil(x2).clamp(1, width).item())
+                    yi2 = int(torch.ceil(y2).clamp(1, height).item())
+
+                    if xi2 <= xi1 or yi2 <= yi1:
+                        targets.append(depth_i.new_tensor(0.0))
+                        valid.append(False)
+                        continue
+
+                    patch = depth_i[yi1:yi2, xi1:xi2]
+                    values = patch[torch.isfinite(patch) & (patch > 0.05)]
+
+                    if values.numel() < self.depth_consistency_min_pixels:
+                        targets.append(depth_i.new_tensor(0.0))
+                        valid.append(False)
+                    else:
+                        targets.append(values.median())
+                        valid.append(True)
+
+        if len(targets) == 0:
+            empty = torch.empty(0, device=device)
+            return empty, empty.bool()
+
+        return (
+            torch.stack(targets).to(device),
+            torch.tensor(valid, dtype=torch.bool, device=device),
+        )
 
 
     def safely_reduce_losses(self, loss):

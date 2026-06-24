@@ -31,6 +31,11 @@ class CubeHead(nn.Module):
         self.pose_type          = cfg.MODEL.ROI_CUBE_HEAD.POSE_TYPE
         self.cluster_bins       = cfg.MODEL.ROI_CUBE_HEAD.CLUSTER_BINS
         self.shared_fc          = cfg.MODEL.ROI_CUBE_HEAD.SHARED_FC
+        self.use_zero_init_residual = cfg.MODEL.ROI_CUBE_HEAD.USE_ZERO_INIT_RESIDUAL
+        self.residual_scale_xy = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_XY
+        self.residual_scale_z = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_Z
+        self.residual_scale_dims = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_DIMS
+        self.residual_scale_pose = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_POSE
 
         #-------------------------------------------
         # Feature generator
@@ -118,12 +123,15 @@ class CubeHead(nn.Module):
 
         # Pose
         if self.pose_type == '6d':
+            pose_dim = 6
             self.bbox_3D_pose = nn.Linear(self._output_size, self.num_classes*6)
 
         elif self.pose_type == 'quaternion':
+            pose_dim = 4
             self.bbox_3D_pose = nn.Linear(self._output_size, self.num_classes*4)
 
         elif self.pose_type == 'euler':
+            pose_dim = 3
             self.bbox_3D_pose = nn.Linear(self._output_size, self.num_classes*3)
 
         else:
@@ -143,6 +151,20 @@ class CubeHead(nn.Module):
             nn.init.normal_(self.bbox_3D_uncertainty.weight, std=0.001)
             nn.init.constant_(self.bbox_3D_uncertainty.bias, 5)
 
+        if self.use_zero_init_residual:
+            self.res_bbox_3D_center_deltas = nn.Linear(self._output_size, self.num_classes*2)
+            self.res_bbox_3D_dims = nn.Linear(self._output_size, self.num_classes*3)
+            self.res_bbox_3D_pose = nn.Linear(self._output_size, self.num_classes*pose_dim)
+            self.res_bbox_3D_center_depth = nn.Linear(self._output_size, self.num_classes*cluster_bins)
+            for layer in [
+                self.res_bbox_3D_center_deltas,
+                self.res_bbox_3D_dims,
+                self.res_bbox_3D_pose,
+                self.res_bbox_3D_center_depth,
+            ]:
+                nn.init.constant_(layer.weight, 0.0)
+                nn.init.constant_(layer.bias, 0.0)
+
 
     def forward(self, x):
     
@@ -159,14 +181,31 @@ class CubeHead(nn.Module):
             box_pose = self.bbox_3D_pose(features)
             box_z = self.bbox_3D_center_depth(features)
 
+            if self.use_zero_init_residual:
+                box_2d_deltas = box_2d_deltas + self.residual_scale_xy * self.res_bbox_3D_center_deltas(features)
+                box_dims = box_dims + self.residual_scale_dims * self.res_bbox_3D_dims(features)
+                box_pose = box_pose + self.residual_scale_pose * self.res_bbox_3D_pose(features)
+                box_z = box_z + self.residual_scale_z * self.res_bbox_3D_center_depth(features)
+
             if self.use_conf:
                 box_uncert = self.bbox_3D_uncertainty(features).clip(0.01)
         else:
 
-            box_2d_deltas = self.bbox_3D_center_deltas(self.feature_generator_XY(x))
-            box_dims = self.bbox_3D_dims(self.feature_generator_dims(x))
-            box_pose = self.bbox_3D_pose(self.feature_generator_pose(x))
-            box_z = self.bbox_3D_center_depth(self.feature_generator_Z(x))
+            features_xy = self.feature_generator_XY(x)
+            features_dims = self.feature_generator_dims(x)
+            features_pose = self.feature_generator_pose(x)
+            features_z = self.feature_generator_Z(x)
+
+            box_2d_deltas = self.bbox_3D_center_deltas(features_xy)
+            box_dims = self.bbox_3D_dims(features_dims)
+            box_pose = self.bbox_3D_pose(features_pose)
+            box_z = self.bbox_3D_center_depth(features_z)
+
+            if self.use_zero_init_residual:
+                box_2d_deltas = box_2d_deltas + self.residual_scale_xy * self.res_bbox_3D_center_deltas(features_xy)
+                box_dims = box_dims + self.residual_scale_dims * self.res_bbox_3D_dims(features_dims)
+                box_pose = box_pose + self.residual_scale_pose * self.res_bbox_3D_pose(features_pose)
+                box_z = box_z + self.residual_scale_z * self.res_bbox_3D_center_depth(features_z)
 
             if self.use_conf:
                 box_uncert = self.bbox_3D_uncertainty(self.feature_generator_conf(x)).clip(0.01)

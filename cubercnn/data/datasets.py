@@ -408,7 +408,7 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
     
     # optional per image keys to pass if exists
     # this property is unique to KITTI. 
-    img_keys_optional = ['p2']
+    img_keys_optional = ['p2', 'depth_file_name', 'depth_path', 'depth_file_path']
 
     invalid_count = 0
     

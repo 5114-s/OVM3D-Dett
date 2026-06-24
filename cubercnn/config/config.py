@@ -119,6 +119,7 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_Z = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DIMS = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT = False
 
     cfg.MODEL.DLA = CN()
 
@@ -146,6 +147,11 @@ def get_cfg_defaults(cfg):
 
     cfg.INPUT.RANDOM_FLIP = "horizontal"
 
+    # Optional metric depth input. When enabled, DatasetMapper3D loads a cached
+    # depth map and the 3D RoI head may use it as a point-map feature.
+    cfg.INPUT.USE_DEPTH = False
+    cfg.INPUT.DEPTH_ROOT = ""
+
     # When True, we will use localization uncertainty
     # as the new IoUness score in the RPN.
     cfg.MODEL.RPN.OBJECTNESS_UNCERTAINTY = 'IoUness'
@@ -154,6 +160,26 @@ def get_cfg_defaults(cfg):
     # an RoI 2D box before doing any pooling to give more context. 
     # Ex. 1.5 makes width and height 50% larger. 
     cfg.MODEL.ROI_CUBE_HEAD.SCALE_ROI_BOXES = 0.0
+
+    # OVMono3D/DetAny3D-inspired depth adapter for the 3D RoI feature. The
+    # adapter is zero-initialized so enabling it starts from the original model.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_ROI = False
+    cfg.MODEL.ROI_CUBE_HEAD.DEPTH_ADAPTER_SCALE = 1.0
+
+    # Training-only depth consistency regularizer. This uses cached metric depth
+    # to regularize predicted object depth without adding a test-time dependency.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_CONSISTENCY_LOSS = False
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DEPTH_CONSISTENCY = 0.05
+    cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MIN_PIXELS = 16
+    cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP = 0.75
+
+    # DetAny3D-style zero-initialized residual prediction branches. These do not
+    # change the initial outputs but can learn small corrections during training.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_ZERO_INIT_RESIDUAL = False
+    cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_XY = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_Z = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_DIMS = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_POSE = 1.0
 
     # weight path specifically for pretraining (no checkpointables will be loaded)
     cfg.MODEL.WEIGHTS_PRETRAIN = ''
