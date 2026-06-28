@@ -15,6 +15,14 @@ from unidepth.models import UniDepthV1
 def parse_args():
     parser = argparse.ArgumentParser(description="Dataset Configuration")
     parser.add_argument('--dataset', type=str, default='SUNRGBD', help='Name of the dataset')
+    parser.add_argument(
+        '--splits',
+        nargs='+',
+        choices=['train', 'val', 'test'],
+        default=['train', 'val'],
+    )
+    parser.add_argument('--output_root', default='pseudo_label')
+    parser.add_argument('--resume', action='store_true')
     return parser.parse_args()
 
 version="v1"
@@ -26,8 +34,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
 
-def process(dataset):
-    for mode in ['train', 'val']:
+def process(dataset, splits, output_root, resume):
+    for mode in splits:
         with open(f'datasets/Omni3D/{dataset}_{mode}.json', 'r') as file:
             data = json.load(file)
 
@@ -37,17 +45,20 @@ def process(dataset):
             intrinsics = np.array(data['images'][i]['K']).reshape(3,3)
             intrinsics = torch.from_numpy(intrinsics).float()
             file_name = data['images'][i]['id']
+            outdir = f'{output_root}/{dataset}/{mode}/depth'
+            os.makedirs(outdir, exist_ok=True)
+            output_path = os.path.join(outdir, f"{file_name}.npy")
+            if resume and os.path.exists(output_path):
+                continue
 
             predictions = model.infer(rgb, intrinsics)
             depth = predictions["depth"]
             intrinsics = predictions["intrinsics"]
 
-            outdir = f'pseudo_label/{dataset}/{mode}/depth'
-            os.makedirs(outdir, exist_ok=True)
-            np.save(os.path.join(outdir, f"{file_name}"), depth.cpu().numpy().squeeze(0).squeeze(0))
+            np.save(output_path, depth.cpu().numpy().squeeze(0).squeeze(0))
 
 
 if __name__ == "__main__":
     args = parse_args()
     print(f"Dataset name: {args.dataset}")
-    process(args.dataset)
+    process(args.dataset, args.splits, args.output_root, args.resume)

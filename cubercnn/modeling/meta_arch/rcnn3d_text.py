@@ -45,6 +45,7 @@ class RCNN3D_text(GeneralizedRCNN):
 
         images = self.preprocess_image(batched_inputs)
         prompt_depth = self.preprocess_depth(batched_inputs)
+        prompt_ground = self.preprocess_ground(batched_inputs)
 
         # scaling factor for the sample relative to its original scale
         # e.g., how much has the image been upsampled by? or downsampled?
@@ -66,6 +67,7 @@ class RCNN3D_text(GeneralizedRCNN):
             Ks, im_scales_ratio, 
             gt_instances,
             prompt_depth=prompt_depth,
+            prompt_ground=prompt_ground,
         )
 
         if self.vis_period > 0:
@@ -89,6 +91,7 @@ class RCNN3D_text(GeneralizedRCNN):
 
         images = self.preprocess_image(batched_inputs)
         prompt_depth = self.preprocess_depth(batched_inputs)
+        prompt_ground = self.preprocess_ground(batched_inputs)
 
         # scaling factor for the sample relative to its original scale
         # e.g., how much has the image been upsampled by? or downsampled?
@@ -105,6 +108,7 @@ class RCNN3D_text(GeneralizedRCNN):
             results, _ = self.roi_heads(
                 images, features, text_embeddings, oracles, Ks, im_scales_ratio,
                 None, prompt_depth=prompt_depth,
+                prompt_ground=prompt_ground,
             )
         
         # normal inference
@@ -113,6 +117,7 @@ class RCNN3D_text(GeneralizedRCNN):
             results, _ = self.roi_heads(
                 images, features, text_embeddings, proposals, Ks, im_scales_ratio,
                 None, prompt_depth=prompt_depth,
+                prompt_ground=prompt_ground,
             )
 
         if do_postprocess:
@@ -122,11 +127,38 @@ class RCNN3D_text(GeneralizedRCNN):
             return results
 
     def preprocess_depth(self, batched_inputs: List[Dict[str, torch.Tensor]]):
-        if len(batched_inputs) == 0 or "depth" not in batched_inputs[0]:
+        if len(batched_inputs) == 0 or not any("depth" in x for x in batched_inputs):
             return None
-        depths = [x["depth"].to(self.device).float() for x in batched_inputs]
+        depths = [
+            x["depth"].to(self.device).float()
+            if "depth" in x
+            else torch.zeros(
+                (1, *x["image"].shape[-2:]),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for x in batched_inputs
+        ]
         size_divisibility = getattr(self.backbone, "size_divisibility", 0)
         return ImageList.from_tensors(depths, size_divisibility)
+
+    def preprocess_ground(self, batched_inputs: List[Dict[str, torch.Tensor]]):
+        if len(batched_inputs) == 0 or not any(
+            "ground_mask" in x for x in batched_inputs
+        ):
+            return None
+        masks = [
+            x["ground_mask"].to(self.device).float()
+            if "ground_mask" in x
+            else torch.zeros(
+                (1, *x["image"].shape[-2:]),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for x in batched_inputs
+        ]
+        size_divisibility = getattr(self.backbone, "size_divisibility", 0)
+        return ImageList.from_tensors(masks, size_divisibility)
 
     def visualize_training(self, batched_inputs, proposals, instances):
         """

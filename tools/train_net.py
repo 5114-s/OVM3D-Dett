@@ -55,6 +55,216 @@ from transformers import BertTokenizer, BertModel
 MAX_TRAINING_ATTEMPTS = 10
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def build_ema_teacher(model):
+    student = unwrap_model(model)
+    student_dino = getattr(student.roi_heads, "dino_encoder", None)
+    shared_dino_backbone = (
+        getattr(student_dino, "model", None)
+        if student_dino is not None
+        else None
+    )
+    if shared_dino_backbone is not None:
+        student_dino.model = torch.nn.Identity()
+    try:
+        teacher = copy.deepcopy(student)
+    finally:
+        if shared_dino_backbone is not None:
+            student_dino.model = shared_dino_backbone
+    if shared_dino_backbone is not None:
+        teacher.roi_heads.dino_encoder.model = shared_dino_backbone
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+    return teacher
+
+
+@torch.no_grad()
+def update_ema_teacher(teacher, model, decay):
+    student = unwrap_model(model)
+    teacher_parameters = dict(teacher.named_parameters())
+    for name, student_parameter in student.named_parameters():
+        teacher_parameter = teacher_parameters.get(name)
+        if teacher_parameter is None or teacher_parameter is student_parameter:
+            continue
+        teacher_parameter.mul_(decay).add_(
+            student_parameter.detach(),
+            alpha=1.0 - decay,
+        )
+    teacher_buffers = dict(teacher.named_buffers())
+    for name, student_buffer in student.named_buffers():
+        teacher_buffer = teacher_buffers.get(name)
+        if teacher_buffer is None or teacher_buffer is student_buffer:
+            continue
+        teacher_buffer.copy_(student_buffer.detach())
+
+
+def project_rotation_matrix(matrix):
+    u, _, vh = torch.linalg.svd(matrix)
+    rotation = u @ vh
+    determinant = torch.det(rotation)
+    if determinant < 0:
+        u[:, -1] *= -1
+        rotation = u @ vh
+    return rotation
+
+
+@torch.no_grad()
+def apply_ema_teacher_targets(
+    cfg,
+    teacher,
+    data,
+    text_embeddings,
+    iteration,
+):
+    warmup = int(cfg.MODEL.EMA_TEACHER.WARMUP_ITERS)
+    if iteration < warmup:
+        return 0, 0.0
+    max_blend = float(cfg.MODEL.EMA_TEACHER.MAX_BLEND)
+    min_score = float(cfg.MODEL.EMA_TEACHER.MIN_SCORE)
+    ramp = min(1.0, (iteration - warmup + 1) / max(warmup, 1))
+    device = next(teacher.parameters()).device
+
+    teacher_inputs = []
+    valid_indices = []
+    for sample in data:
+        instances = sample.get("instances")
+        if instances is None:
+            indices = torch.empty(0, dtype=torch.long)
+            boxes = torch.empty((0, 4), device=device)
+            classes = torch.empty(0, dtype=torch.long, device=device)
+            render_masks = torch.empty((0, 28, 28), device=device)
+        else:
+            classes_all = instances.gt_classes
+            valid = (
+                (classes_all >= 0)
+                & (classes_all < cfg.MODEL.ROI_HEADS.NUM_CLASSES)
+            )
+            indices = torch.nonzero(valid, as_tuple=False).flatten()
+            boxes = instances.gt_boxes.tensor[indices].to(device)
+            classes = classes_all[indices].to(device)
+            render_masks = (
+                instances.gt_render_masks[indices].to(device)
+                if instances.has("gt_render_masks")
+                else torch.empty((len(indices), 28, 28), device=device)
+            )
+        valid_indices.append(indices)
+        teacher_sample = {
+            key: value
+            for key, value in sample.items()
+            if key != "instances"
+        }
+        teacher_sample["oracle2D"] = {
+            "gt_bbox2D": boxes,
+            "gt_classes": classes,
+            "gt_render_masks": render_masks,
+        }
+        teacher_inputs.append(teacher_sample)
+
+    if not teacher_inputs:
+        return 0, 0.0
+
+    predictions = teacher.inference(
+        teacher_inputs,
+        text_embeddings,
+        do_postprocess=False,
+    )
+    updated = 0
+    blend_values = []
+    for sample, indices, prediction in zip(data, valid_indices, predictions):
+        if indices.numel() == 0 or len(prediction) == 0:
+            continue
+        count = min(indices.numel(), len(prediction))
+        indices = indices[:count]
+        instances = sample["instances"]
+        scores = prediction.scores[:count].detach().cpu()
+        centers = prediction.pred_center_cam[:count].detach().cpu()
+        center_2d = prediction.pred_center_2D[:count].detach().cpu()
+        dimensions = prediction.pred_dimensions[:count].detach().cpu()
+        poses = prediction.pred_pose[:count].detach().cpu()
+        geometry_scores = (
+            prediction.pred_geometry_score[:count].detach().cpu()
+            if prediction.has("pred_geometry_score")
+            else torch.ones(count)
+        )
+        geometry_confidence = (
+            prediction.pred_geometry_confidence[:count].detach().cpu()
+            if prediction.has("pred_geometry_confidence")
+            else torch.ones(count)
+        )
+        current_height = max(int(sample["image"].shape[1]), 1)
+        image_scale = float(sample["height"]) / current_height
+        center_2d = center_2d / max(image_scale, 1e-6)
+
+        target_boxes = instances.gt_boxes3D
+        target_poses = instances.gt_poses
+        if instances.has("gt_pseudo_weight_joint"):
+            source_confidence = instances.gt_pseudo_weight_joint[indices]
+        elif instances.has("gt_pseudo_weight"):
+            source_confidence = instances.gt_pseudo_weight[indices]
+        else:
+            source_confidence = torch.ones(count)
+
+        for local_index, target_index in enumerate(indices.tolist()):
+            score = float(scores[local_index])
+            geometry_score = float(
+                geometry_scores[local_index] * geometry_confidence[local_index]
+            )
+            center = centers[local_index]
+            dims = dimensions[local_index]
+            pose = poses[local_index]
+            if (
+                score < min_score
+                or geometry_score < float(cfg.MODEL.EMA_TEACHER.MIN_GEOMETRY_SCORE)
+                or not torch.isfinite(center).all()
+                or not torch.isfinite(dims).all()
+                or not torch.isfinite(pose).all()
+                or center[2] <= 0.05
+                or torch.any(dims <= 0.01)
+            ):
+                continue
+            blend = (
+                max_blend
+                * ramp
+                * score
+                * geometry_score
+                * (1.0 - 0.5 * float(source_confidence[local_index]))
+            )
+            blend = float(np.clip(blend, 0.0, max_blend))
+            if blend <= 0:
+                continue
+
+            old_box = target_boxes[target_index]
+            old_center = old_box[6:9]
+            old_dims = old_box[3:6].clamp(min=0.01)
+            blended_center = (1.0 - blend) * old_center + blend * center
+            blended_dims = torch.exp(
+                (1.0 - blend) * torch.log(old_dims)
+                + blend * torch.log(dims.clamp(min=0.01))
+            )
+            blended_center_2d = (
+                (1.0 - blend) * old_box[:2]
+                + blend * center_2d[local_index]
+            )
+            target_boxes[target_index, :2] = blended_center_2d
+            target_boxes[target_index, 2] = blended_center[2]
+            target_boxes[target_index, 3:6] = blended_dims
+            target_boxes[target_index, 6:9] = blended_center
+            blended_pose = (
+                (1.0 - blend) * target_poses[target_index]
+                + blend * pose
+            )
+            target_poses[target_index] = project_rotation_matrix(blended_pose)
+            updated += 1
+            blend_values.append(blend)
+
+    mean_blend = float(np.mean(blend_values)) if blend_values else 0.0
+    return updated, mean_blend
+
+
 def do_test(cfg, model, text_embeddings, iteration='final', storage=None):
         
     filter_settings = data.get_filter_settings_from_cfg(cfg)    
@@ -146,6 +356,11 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, text_emb
     # determine the starting iteration, if resuming
     start_iter = (checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1)
     iteration = start_iter
+    ema_teacher = (
+        build_ema_teacher(model)
+        if cfg.MODEL.EMA_TEACHER.ENABLED
+        else None
+    )
 
     logger.info("Starting training from iteration {}".format(start_iter))
 
@@ -179,6 +394,26 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, text_emb
 
             data = next(data_iter)
             storage.iter = iteration
+
+            if ema_teacher is not None:
+                ema_updated, ema_blend = apply_ema_teacher_targets(
+                    cfg,
+                    ema_teacher,
+                    data,
+                    text_embeddings,
+                    iteration,
+                )
+                if comm.is_main_process():
+                    storage.put_scalar(
+                        "ema_teacher/updated_targets",
+                        ema_updated,
+                        smoothing_hint=False,
+                    )
+                    storage.put_scalar(
+                        "ema_teacher/mean_blend",
+                        ema_blend,
+                        smoothing_hint=False,
+                    )
 
             # forward
             loss_dict = model(data, text_embeddings)
@@ -250,6 +485,15 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, text_emb
 
             else:
                 optimizer.step()
+                if (
+                    ema_teacher is not None
+                    and (iteration + 1) % int(cfg.MODEL.EMA_TEACHER.UPDATE_INTERVAL) == 0
+                ):
+                    update_ema_teacher(
+                        ema_teacher,
+                        model,
+                        float(cfg.MODEL.EMA_TEACHER.DECAY),
+                    )
                 storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
                 iterations_success += 1
 
@@ -284,6 +528,7 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, text_emb
                 del optimizer
                 del checkpointer
                 del periodic_checkpointer
+                del ema_teacher
                 return False
                 
             scheduler.step()

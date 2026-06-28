@@ -19,6 +19,13 @@ from detectron2.modeling.roi_heads import (
 )
 from detectron2.modeling.poolers import ROIPooler
 from cubercnn.modeling.roi_heads.cube_head import build_cube_head
+from cubercnn.modeling.roi_heads.geometry_interpreter import (
+    FrozenDINOv2MultiScale,
+    MultiHypothesisGeometryInterpreter,
+    SoftCuboidRenderer,
+    build_ray_map,
+    roi_align_map,
+)
 from cubercnn.modeling.proposal_generator.rpn import subsample_labels
 from cubercnn.modeling.roi_heads.fast_rcnn_text import FastRCNNOutputs_text
 from cubercnn import util
@@ -59,6 +66,45 @@ def depth_to_point_map(depth, Ks_scaled):
     return torch.where(valid, point_map, torch.zeros_like(point_map))
 
 
+@torch.no_grad()
+def estimate_ground_planes(point_map, ground_mask):
+    if point_map is None or ground_mask is None:
+        return None
+    if ground_mask.dim() == 3:
+        ground_mask = ground_mask.unsqueeze(1)
+    planes = []
+    for points_i, mask_i in zip(point_map, ground_mask):
+        points = points_i.permute(1, 2, 0).reshape(-1, 3)
+        mask = mask_i[0].reshape(-1) > 0.5
+        valid = (
+            mask
+            & torch.isfinite(points).all(dim=1)
+            & (points[:, 2] > 0.05)
+        )
+        points = points[valid]
+        if points.shape[0] < 32:
+            planes.append(points_i.new_tensor([0.0, 1.0, 0.0, 0.0, 0.0]))
+            continue
+        if points.shape[0] > 5000:
+            indices = torch.linspace(
+                0,
+                points.shape[0] - 1,
+                5000,
+                device=points.device,
+            ).long()
+            points = points[indices]
+        center = points.median(dim=0).values
+        centered = points - center
+        covariance = centered.T @ centered / max(points.shape[0] - 1, 1)
+        _, eigenvectors = torch.linalg.eigh(covariance)
+        normal = F.normalize(eigenvectors[:, 0], dim=0, eps=1e-6)
+        if normal[1] < 0:
+            normal = -normal
+        offset = -torch.dot(normal, center)
+        planes.append(torch.cat((normal, offset[None], points_i.new_tensor([1.0]))))
+    return torch.stack(planes)
+
+
 class DepthAwareROIPooler(nn.Module):
     def __init__(
         self,
@@ -95,6 +141,54 @@ class DepthAwareROIPooler(nn.Module):
         return roi_features + self.adapter_scale * self.point_adapter(point_features)
 
 
+class RegionSegmentationHead(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_dim=128,
+        mask_size=28,
+        feature_scale=1.0,
+        detach_mask_feature=True,
+    ):
+        super().__init__()
+        self.mask_size = int(mask_size)
+        self.feature_scale = float(feature_scale)
+        self.detach_mask_feature = bool(detach_mask_feature)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.mask_logits = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        self.feature_adapter = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        nn.init.constant_(self.feature_adapter.weight, 0.0)
+        nn.init.constant_(self.feature_adapter.bias, 0.0)
+
+    def forward(self, roi_features):
+        region_features = self.mask_head(roi_features)
+        mask_logits_low = self.mask_logits(region_features)
+        if mask_logits_low.shape[-1] != self.mask_size:
+            mask_logits = F.interpolate(
+                mask_logits_low,
+                size=(self.mask_size, self.mask_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            mask_logits = mask_logits_low
+
+        mask_prob_low = torch.sigmoid(mask_logits_low)
+        if self.detach_mask_feature:
+            mask_prob_low = mask_prob_low.detach()
+        guided_features = roi_features * mask_prob_low
+        enhanced_features = (
+            roi_features
+            + self.feature_scale * self.feature_adapter(guided_features)
+        )
+        return enhanced_features, mask_logits, torch.sigmoid(mask_logits)
+
+
 def build_roi_heads(cfg, input_shape, priors=None):
     """
     Build ROIHeads defined by `cfg.MODEL.ROI_HEADS.NAME`.
@@ -113,6 +207,10 @@ class ROIHeads3D_Text(StandardROIHeads):
         ignore_thresh: float,
         cube_head: nn.Module,
         cube_pooler: nn.Module,
+        geometry_interpreter: nn.Module = None,
+        dino_encoder: nn.Module = None,
+        soft_renderer: nn.Module = None,
+        region_segmentation_head: nn.Module = None,
         loss_w_3d: float,
         loss_w_xy: float,
         loss_w_z: float,
@@ -136,10 +234,38 @@ class ROIHeads3D_Text(StandardROIHeads):
         scale_roi_boxes=None,
         use_depth_roi=None,
         use_pseudo_weight=None,
+        use_factorized_pseudo_weight=None,
         use_depth_consistency_loss=None,
         loss_w_depth_consistency=None,
         depth_consistency_min_pixels=None,
         depth_consistency_center_crop=None,
+        depth_consistency_mode=None,
+        depth_consistency_percentile=None,
+        use_region_segmentation_head=None,
+        loss_w_region_segmentation=None,
+        rsh_use_depth_guidance=None,
+        rsh_depth_mask_threshold=None,
+        rsh_use_pseudo_weight=None,
+        use_geometry_interpreter=None,
+        loss_w_multi_hypothesis=None,
+        use_differentiable_renderer=None,
+        loss_w_render_silhouette=None,
+        loss_w_render_depth=None,
+        render_size=None,
+        geometry_selection_temperature=None,
+        geometry_oracle_weight=None,
+        geometry_projection_weight=None,
+        geometry_silhouette_weight=None,
+        geometry_depth_weight=None,
+        geometry_point_weight=None,
+        geometry_ground_weight=None,
+        loss_w_geometry_closure=None,
+        geometry_apply_to_prediction=None,
+        geometry_apply_in_inference=None,
+        geometry_min_dimension=None,
+        geometry_max_dimension=None,
+        shape_memory_min_confidence=None,
+        shape_memory_max_updates=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -147,10 +273,48 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.scale_roi_boxes = scale_roi_boxes
         self.use_depth_roi = bool(use_depth_roi)
         self.use_pseudo_weight = bool(use_pseudo_weight)
+        self.use_factorized_pseudo_weight = bool(use_factorized_pseudo_weight)
         self.use_depth_consistency_loss = bool(use_depth_consistency_loss)
         self.loss_w_depth_consistency = float(loss_w_depth_consistency or 0.0)
         self.depth_consistency_min_pixels = int(depth_consistency_min_pixels or 16)
         self.depth_consistency_center_crop = float(depth_consistency_center_crop or 1.0)
+        self.depth_consistency_mode = str(depth_consistency_mode or "center")
+        self.depth_consistency_percentile = float(
+            0.35 if depth_consistency_percentile is None else depth_consistency_percentile
+        )
+        self.region_segmentation_head = region_segmentation_head
+        self.use_region_segmentation_head = bool(use_region_segmentation_head)
+        self.loss_w_region_segmentation = float(loss_w_region_segmentation or 0.0)
+        self.rsh_use_depth_guidance = bool(rsh_use_depth_guidance)
+        self.rsh_depth_mask_threshold = float(rsh_depth_mask_threshold or 0.30)
+        self.rsh_use_pseudo_weight = bool(rsh_use_pseudo_weight)
+        self.use_geometry_interpreter = bool(use_geometry_interpreter)
+        self.geometry_interpreter = geometry_interpreter
+        self.dino_encoder = dino_encoder
+        self.loss_w_multi_hypothesis = float(loss_w_multi_hypothesis or 0.0)
+        self.use_differentiable_renderer = bool(use_differentiable_renderer)
+        self.soft_renderer = soft_renderer
+        self.loss_w_render_silhouette = float(loss_w_render_silhouette or 0.0)
+        self.loss_w_render_depth = float(loss_w_render_depth or 0.0)
+        self.render_size = int(render_size or 28)
+        self.geometry_selection_temperature = float(
+            geometry_selection_temperature or 0.20
+        )
+        self.geometry_oracle_weight = float(geometry_oracle_weight or 0.0)
+        self.geometry_projection_weight = float(geometry_projection_weight or 0.0)
+        self.geometry_silhouette_weight = float(geometry_silhouette_weight or 0.0)
+        self.geometry_depth_weight = float(geometry_depth_weight or 0.0)
+        self.geometry_point_weight = float(geometry_point_weight or 0.0)
+        self.geometry_ground_weight = float(geometry_ground_weight or 0.0)
+        self.loss_w_geometry_closure = float(loss_w_geometry_closure or 0.0)
+        self.geometry_apply_to_prediction = bool(geometry_apply_to_prediction)
+        self.geometry_apply_in_inference = bool(geometry_apply_in_inference)
+        self.geometry_min_dimension = float(geometry_min_dimension or 0.03)
+        self.geometry_max_dimension = float(geometry_max_dimension or 8.0)
+        self.shape_memory_min_confidence = float(
+            shape_memory_min_confidence or 0.65
+        )
+        self.shape_memory_max_updates = int(shape_memory_max_updates or 32)
 
         # rotation settings
         self.allocentric_pose = allocentric_pose
@@ -266,10 +430,59 @@ class ROIHeads3D_Text(StandardROIHeads):
         )
 
         cube_head = build_cube_head(cfg, shape)
+        use_geometry_interpreter = bool(
+            cfg.MODEL.ROI_CUBE_HEAD.USE_GEOMETRY_INTERPRETER
+        )
+        geometry_interpreter = None
+        dino_encoder = None
+        soft_renderer = None
+        region_segmentation_head = None
+        if cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD:
+            region_segmentation_head = RegionSegmentationHead(
+                in_channels=in_channels,
+                hidden_dim=cfg.MODEL.ROI_CUBE_HEAD.RSH_HIDDEN_DIM,
+                mask_size=cfg.MODEL.ROI_CUBE_HEAD.RSH_MASK_SIZE,
+                feature_scale=cfg.MODEL.ROI_CUBE_HEAD.RSH_FEATURE_SCALE,
+                detach_mask_feature=cfg.MODEL.ROI_CUBE_HEAD.RSH_DETACH_MASK_FEATURE,
+            )
+        if use_geometry_interpreter:
+            dino_encoder = FrozenDINOv2MultiScale(
+                checkpoint=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_CHECKPOINT,
+                image_size=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_IMAGE_SIZE,
+                output_dim=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_OUTPUT_DIM,
+                layers=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_LAYERS,
+                pixel_mean=cfg.MODEL.PIXEL_MEAN,
+                pixel_std=cfg.MODEL.PIXEL_STD,
+                input_format=cfg.INPUT.FORMAT,
+                chunk_size=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_CHUNK_SIZE,
+            )
+            geometry_interpreter = MultiHypothesisGeometryInterpreter(
+                visual_channels=in_channels,
+                dino_channels=cfg.MODEL.ROI_CUBE_HEAD.DINOV2_OUTPUT_DIM,
+                hidden_dim=cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_HIDDEN_DIM,
+                num_hypotheses=cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_NUM_HYPOTHESES,
+                num_layers=cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_NUM_LAYERS,
+                num_heads=cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_NUM_HEADS,
+                residual_scale=cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_RESIDUAL_SCALE,
+                shape_memory_capacity=cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_CAPACITY,
+                shape_memory_topk=cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_TOPK,
+                shape_memory_momentum=cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_MOMENTUM,
+                shape_prototype_blend=cfg.MODEL.ROI_CUBE_HEAD.SHAPE_PROTOTYPE_BLEND,
+            )
+        if cfg.MODEL.ROI_CUBE_HEAD.USE_DIFFERENTIABLE_RENDERER:
+            soft_renderer = SoftCuboidRenderer(
+                render_size=cfg.MODEL.ROI_CUBE_HEAD.RENDER_SIZE,
+                edge_softness=cfg.MODEL.ROI_CUBE_HEAD.RENDER_EDGE_SOFTNESS,
+                depth_temperature=cfg.MODEL.ROI_CUBE_HEAD.RENDER_DEPTH_TEMPERATURE,
+            )
 
         return {
             'cube_head': cube_head,
             'cube_pooler': cube_pooler,
+            'geometry_interpreter': geometry_interpreter,
+            'dino_encoder': dino_encoder,
+            'soft_renderer': soft_renderer,
+            'region_segmentation_head': region_segmentation_head,
             'use_confidence': cfg.MODEL.ROI_CUBE_HEAD.USE_CONFIDENCE,
             'inverse_z_weight': cfg.MODEL.ROI_CUBE_HEAD.INVERSE_Z_WEIGHT,
             'loss_w_3d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D,
@@ -293,18 +506,56 @@ class ROIHeads3D_Text(StandardROIHeads):
             'scale_roi_boxes': cfg.MODEL.ROI_CUBE_HEAD.SCALE_ROI_BOXES,
             'use_depth_roi': use_depth_roi,
             'use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT,
+            'use_factorized_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT,
             'use_depth_consistency_loss': cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_CONSISTENCY_LOSS,
             'loss_w_depth_consistency': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DEPTH_CONSISTENCY,
             'depth_consistency_min_pixels': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MIN_PIXELS,
             'depth_consistency_center_crop': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP,
+            'depth_consistency_mode': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE,
+            'depth_consistency_percentile': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE,
+            'use_region_segmentation_head': cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD,
+            'loss_w_region_segmentation': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION,
+            'rsh_use_depth_guidance': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE,
+            'rsh_depth_mask_threshold': cfg.MODEL.ROI_CUBE_HEAD.RSH_DEPTH_MASK_THRESHOLD,
+            'rsh_use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_PSEUDO_WEIGHT,
+            'use_geometry_interpreter': use_geometry_interpreter,
+            'loss_w_multi_hypothesis': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_MULTI_HYPOTHESIS,
+            'use_differentiable_renderer': cfg.MODEL.ROI_CUBE_HEAD.USE_DIFFERENTIABLE_RENDERER,
+            'loss_w_render_silhouette': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_RENDER_SILHOUETTE,
+            'loss_w_render_depth': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_RENDER_DEPTH,
+            'render_size': cfg.MODEL.ROI_CUBE_HEAD.RENDER_SIZE,
+            'geometry_selection_temperature': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_SELECTION_TEMPERATURE,
+            'geometry_oracle_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_ORACLE_WEIGHT,
+            'geometry_projection_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_PROJECTION_WEIGHT,
+            'geometry_silhouette_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_SILHOUETTE_WEIGHT,
+            'geometry_depth_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_DEPTH_WEIGHT,
+            'geometry_point_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_POINT_WEIGHT,
+            'geometry_ground_weight': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_GROUND_WEIGHT,
+            'loss_w_geometry_closure': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_GEOMETRY_CLOSURE,
+            'geometry_apply_to_prediction': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_APPLY_TO_PREDICTION,
+            'geometry_apply_in_inference': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_APPLY_IN_INFERENCE,
+            'geometry_min_dimension': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_MIN_DIMENSION,
+            'geometry_max_dimension': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_MAX_DIMENSION,
+            'shape_memory_min_confidence': cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_MIN_CONFIDENCE,
+            'shape_memory_max_updates': cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_MAX_UPDATES,
         }
 
 
-    def forward(self, images, features, text_embeddings, proposals, Ks, im_scales_ratio, targets=None, prompt_depth=None):
+    def forward(
+        self,
+        images,
+        features,
+        text_embeddings,
+        proposals,
+        Ks,
+        im_scales_ratio,
+        targets=None,
+        prompt_depth=None,
+        prompt_ground=None,
+    ):
 
         im_dims = [image.shape[1:] for image in images]
-
-        del images
+        image_tensor = images.tensor
 
         if self.training:
             proposals = self.label_and_sample_proposals(proposals, targets)
@@ -318,6 +569,8 @@ class ROIHeads3D_Text(StandardROIHeads):
                 instances_3d, losses_cube = self._forward_cube(
                     features, proposals, Ks, im_dims, im_scales_ratio,
                     prompt_depth=prompt_depth,
+                    prompt_ground=prompt_ground,
+                    image_tensor=image_tensor,
                 )
                 losses.update(losses_cube)
 
@@ -335,6 +588,8 @@ class ROIHeads3D_Text(StandardROIHeads):
                     pred_instances_i.pred_boxes = Boxes(proposal['gt_bbox2D'])
                     pred_instances_i.pred_classes =  proposal['gt_classes']
                     pred_instances_i.scores = torch.ones_like(proposal['gt_classes']).float()
+                    if "gt_render_masks" in proposal:
+                        pred_instances_i.render_masks = proposal["gt_render_masks"]
                     pred_instances.append(pred_instances_i)
             else:
                 pred_instances = self._forward_box(features, text_embeddings, proposals)
@@ -343,6 +598,8 @@ class ROIHeads3D_Text(StandardROIHeads):
                 pred_instances = self._forward_cube(
                     features, pred_instances, Ks, im_dims, im_scales_ratio,
                     prompt_depth=prompt_depth,
+                    prompt_ground=prompt_ground,
+                    image_tensor=image_tensor,
                 )
             return pred_instances, {}
     
@@ -404,6 +661,439 @@ class ROIHeads3D_Text(StandardROIHeads):
         l1 = (l1_dist.min(1).values.mean(-1) + l1_dist.min(2).values.mean(-1))
         return l1
 
+    def yaw_rotation_matrix(self, yaw):
+        cosine = torch.cos(yaw)
+        sine = torch.sin(yaw)
+        zeros = torch.zeros_like(yaw)
+        ones = torch.ones_like(yaw)
+        row0 = torch.stack((cosine, zeros, sine), dim=-1)
+        row1 = torch.stack((zeros, ones, zeros), dim=-1)
+        row2 = torch.stack((-sine, zeros, cosine), dim=-1)
+        return torch.stack((row0, row1, row2), dim=-2)
+
+    def apply_geometry_hypotheses(
+        self,
+        cube_x,
+        cube_y,
+        cube_z,
+        cube_dims,
+        cube_pose,
+        src_widths,
+        src_heights,
+        hypothesis_deltas,
+        hypothesis_quality,
+        hypothesis_log_variance,
+        explicit_anchor,
+        intrinsics,
+        roi_boxes,
+        point_roi,
+        target_silhouette=None,
+        observed_depth_roi=None,
+        gt_boxes3D=None,
+        gt_poses=None,
+        factor_weights=None,
+        ground_planes=None,
+    ):
+        if self.soft_renderer is None:
+            raise RuntimeError(
+                "Geometry hypothesis closure requires USE_DIFFERENTIABLE_RENDERER=True."
+            )
+        cube_x3d = cube_z * (
+            cube_x - intrinsics[:, 0, 2]
+        ) / intrinsics[:, 0, 0]
+        cube_y3d = cube_z * (
+            cube_y - intrinsics[:, 1, 2]
+        ) / intrinsics[:, 1, 1]
+        cube_center = torch.stack((cube_x3d, cube_y3d, cube_z), dim=1)
+
+        anchor_confidence = explicit_anchor["confidence"].clamp(0.0, 1.0)
+        anchor_center = explicit_anchor["center"].to(cube_center)
+        anchor_dims = explicit_anchor["dimensions"].to(cube_dims).clamp(
+            min=self.geometry_min_dimension,
+            max=self.geometry_max_dimension,
+        )
+        anchor_yaw = explicit_anchor["yaw"].to(cube_z)
+        base_center = (
+            anchor_confidence[:, None] * anchor_center
+            + (1.0 - anchor_confidence[:, None]) * cube_center
+        )
+        base_dims = torch.exp(
+            anchor_confidence[:, None] * torch.log(anchor_dims)
+            + (1.0 - anchor_confidence[:, None])
+            * torch.log(cube_dims.clamp(min=0.01))
+        )
+        anchor_pose = self.yaw_rotation_matrix(anchor_yaw)
+        mixed_pose = (
+            anchor_confidence[:, None, None] * anchor_pose
+            + (1.0 - anchor_confidence[:, None, None]) * cube_pose
+        )
+        with torch.no_grad():
+            u, _, vh = torch.linalg.svd(mixed_pose.detach())
+            projected_pose = u @ vh
+            negative_determinant = torch.det(projected_pose) < 0
+            if negative_determinant.any():
+                u = u.clone()
+                u[negative_determinant, :, -1] *= -1
+                projected_pose = u @ vh
+        # Keep the projected rotation in the forward pass while avoiding the
+        # unstable SVD backward at repeated or nearly repeated singular values.
+        base_pose = mixed_pose + (projected_pose - mixed_pose).detach()
+        base_z = base_center[:, 2].clamp(min=0.05)
+        base_x = (
+            intrinsics[:, 0, 0] * base_center[:, 0] / base_z
+            + intrinsics[:, 0, 2]
+        )
+        base_y = (
+            intrinsics[:, 1, 1] * base_center[:, 1] / base_z
+            + intrinsics[:, 1, 2]
+        )
+
+        delta_xy = hypothesis_deltas[:, :, :2]
+        delta_log_z = hypothesis_deltas[:, :, 2]
+        delta_log_dims = hypothesis_deltas[:, :, 3:6]
+        delta_yaw = hypothesis_deltas[:, :, 6]
+
+        candidate_x = base_x[:, None] + src_widths[:, None] * delta_xy[:, :, 0]
+        candidate_y = base_y[:, None] + src_heights[:, None] * delta_xy[:, :, 1]
+        candidate_z = base_z[:, None] * torch.exp(delta_log_z.clamp(-0.7, 0.7))
+        candidate_dims = base_dims[:, None, :] * torch.exp(
+            delta_log_dims.clamp(-0.7, 0.7)
+        )
+        candidate_dims = candidate_dims.clamp(
+            min=self.geometry_min_dimension,
+            max=self.geometry_max_dimension,
+        )
+        yaw_rotation = self.yaw_rotation_matrix(delta_yaw)
+        candidate_pose = torch.matmul(base_pose[:, None, :, :], yaw_rotation)
+        candidate_x3d = candidate_z * (
+            candidate_x - intrinsics[:, None, 0, 2]
+        ) / intrinsics[:, None, 0, 0]
+        candidate_y3d = candidate_z * (
+            candidate_y - intrinsics[:, None, 1, 2]
+        ) / intrinsics[:, None, 1, 1]
+        candidate_center = torch.stack(
+            (candidate_x3d, candidate_y3d, candidate_z),
+            dim=-1,
+        )
+
+        batch_size, hypotheses = candidate_z.shape
+        flat_box = torch.cat(
+            (
+                candidate_center.reshape(-1, 3),
+                candidate_dims.reshape(-1, 3),
+            ),
+            dim=1,
+        )
+        flat_pose = candidate_pose.reshape(-1, 3, 3)
+        candidate_corners = util.get_cuboid_verts_faces(
+            flat_box,
+            flat_pose,
+        )[0].reshape(batch_size, hypotheses, 8, 3)
+
+        projected = torch.matmul(
+            intrinsics[:, None, None, :, :],
+            candidate_corners.unsqueeze(-1),
+        ).squeeze(-1)
+        projected_uv = projected[..., :2] / projected[..., 2:3].clamp(min=1e-4)
+        projected_min = projected_uv.min(dim=2).values
+        projected_max = projected_uv.max(dim=2).values
+        projected_boxes = torch.cat((projected_min, projected_max), dim=-1)
+        target_boxes = roi_boxes[:, None, :].expand_as(projected_boxes)
+        intersection_min = torch.maximum(projected_boxes[..., :2], target_boxes[..., :2])
+        intersection_max = torch.minimum(projected_boxes[..., 2:], target_boxes[..., 2:])
+        intersection_size = (intersection_max - intersection_min).clamp(min=0.0)
+        intersection = intersection_size.prod(dim=-1)
+        projected_area = (
+            (projected_boxes[..., 2:] - projected_boxes[..., :2]).clamp(min=0.0)
+        ).prod(dim=-1)
+        target_area = (
+            (target_boxes[..., 2:] - target_boxes[..., :2]).clamp(min=0.0)
+        ).prod(dim=-1)
+        projection_iou = intersection / (
+            projected_area + target_area - intersection
+        ).clamp(min=1.0)
+        projection_cost = 1.0 - projection_iou
+
+        repeated_intrinsics = intrinsics[:, None].expand(
+            -1, hypotheses, -1, -1
+        ).reshape(-1, 3, 3)
+        repeated_roi_boxes = roi_boxes[:, None].expand(
+            -1, hypotheses, -1
+        ).reshape(-1, 4)
+        rendered_silhouette, rendered_depth = self.soft_renderer(
+            candidate_corners.reshape(-1, 8, 3),
+            repeated_intrinsics,
+            repeated_roi_boxes,
+        )
+        rendered_silhouette = rendered_silhouette.reshape(
+            batch_size, hypotheses, self.render_size, self.render_size
+        )
+        rendered_depth = rendered_depth.reshape(
+            batch_size, hypotheses, self.render_size, self.render_size
+        )
+
+        if target_silhouette is not None:
+            target_silhouette_expanded = target_silhouette[:, None].expand(
+                -1, hypotheses, -1, -1
+            )
+            silhouette_intersection = (
+                rendered_silhouette * target_silhouette_expanded
+            ).sum(dim=(2, 3))
+            silhouette_denominator = (
+                rendered_silhouette.sum(dim=(2, 3))
+                + target_silhouette_expanded.sum(dim=(2, 3))
+            ).clamp(min=1.0)
+            silhouette_cost = 1.0 - (
+                2.0 * silhouette_intersection + 1.0
+            ) / (silhouette_denominator + 1.0)
+        else:
+            silhouette_cost = projection_cost
+
+        if observed_depth_roi is not None:
+            observed_depth_expanded = observed_depth_roi[:, None].expand(
+                -1, hypotheses, -1, -1
+            )
+            valid_depth = (
+                torch.isfinite(observed_depth_expanded)
+                & (observed_depth_expanded > 0.05)
+            )
+            if target_silhouette is not None:
+                valid_depth = valid_depth & (target_silhouette_expanded > 0.5)
+            depth_residual = F.smooth_l1_loss(
+                torch.log(rendered_depth.clamp(0.05, 80.0)),
+                torch.log(observed_depth_expanded.clamp(0.05, 80.0)),
+                reduction="none",
+                beta=0.05,
+            )
+            depth_weight = valid_depth.float() * rendered_silhouette.detach()
+            depth_cost = (
+                depth_residual * depth_weight
+            ).sum(dim=(2, 3)) / depth_weight.sum(dim=(2, 3)).clamp(min=1.0)
+        else:
+            depth_cost = projection_cost.new_zeros(projection_cost.shape)
+
+        points = point_roi.permute(0, 2, 3, 1).reshape(batch_size, -1, 3)
+        valid_points = torch.isfinite(points).all(dim=2) & (points[:, :, 2] > 0.05)
+        difference = points[:, None, :, :] - candidate_center[:, :, None, :]
+        local_points = torch.einsum(
+            "nkpc,nkcd->nkpd",
+            difference,
+            candidate_pose,
+        )
+        half_extent = torch.stack(
+            (
+                candidate_dims[..., 2],
+                candidate_dims[..., 1],
+                candidate_dims[..., 0],
+            ),
+            dim=-1,
+        )[:, :, None, :] * 0.5
+        softness = (candidate_dims.mean(dim=-1) * 0.05).clamp(min=0.01)
+        inside_probability = torch.sigmoid(
+            (half_extent - local_points.abs())
+            / softness[:, :, None, None]
+        ).prod(dim=-1)
+        point_support = (
+            inside_probability * valid_points[:, None].float()
+        ).sum(dim=2) / valid_points.sum(dim=1)[:, None].clamp(min=1.0)
+        point_cost = 1.0 - point_support
+
+        if ground_planes is not None and ground_planes[:, 4].bool().any():
+            normals = ground_planes[:, :3]
+            offsets = ground_planes[:, 3]
+            plane_distance = (
+                (
+                    candidate_corners
+                    * normals[:, None, None, :]
+                ).sum(dim=-1)
+                + offsets[:, None, None]
+            ).abs()
+            ground_cost_plane = (
+                plane_distance.min(dim=2).values
+                / candidate_dims[..., 1].clamp(min=0.05)
+            ).clamp(max=2.0)
+            plane_valid = ground_planes[:, 4].bool()[:, None]
+        else:
+            ground_cost_plane = projection_cost.new_zeros(projection_cost.shape)
+            plane_valid = torch.zeros(
+                (batch_size, 1),
+                dtype=torch.bool,
+                device=projection_cost.device,
+            )
+
+        observed_bottom_values = []
+        fallback_bottom = candidate_corners[..., 1].max(dim=2).values.detach().mean(dim=1)
+        for sample_index in range(batch_size):
+            values = points[sample_index, valid_points[sample_index], 1]
+            if values.numel() > 0:
+                observed_bottom_values.append(torch.quantile(values, 0.90))
+            else:
+                observed_bottom_values.append(fallback_bottom[sample_index])
+        observed_bottom = torch.stack(observed_bottom_values)
+        candidate_bottom = candidate_corners[..., 1].max(dim=2).values
+        local_ground_cost = (
+            (candidate_bottom - observed_bottom[:, None]).abs()
+            / candidate_dims[..., 1].clamp(min=0.05)
+        ).clamp(max=2.0)
+        ground_cost = torch.where(
+            plane_valid,
+            ground_cost_plane,
+            local_ground_cost,
+        )
+
+        geometry_cost = (
+            self.geometry_projection_weight * projection_cost
+            + self.geometry_silhouette_weight * silhouette_cost
+            + self.geometry_depth_weight * depth_cost
+            + self.geometry_point_weight * point_cost
+            + self.geometry_ground_weight * ground_cost
+        )
+
+        auxiliary_losses = {}
+        oracle_cost = None
+        if self.training and gt_boxes3D is not None and gt_poses is not None:
+            gt_xy = gt_boxes3D[:, :2]
+            gt_z = gt_boxes3D[:, 2].clamp(min=0.05)
+            gt_dims = gt_boxes3D[:, 3:6].clamp(min=0.01)
+            xy_error = (
+                (candidate_x - gt_xy[:, None, 0]).abs()
+                / src_widths[:, None].clamp(min=1.0)
+                + (candidate_y - gt_xy[:, None, 1]).abs()
+                / src_heights[:, None].clamp(min=1.0)
+            ) * 0.5
+            z_error = (
+                torch.log(candidate_z.clamp(min=0.05))
+                - torch.log(gt_z[:, None])
+            ).abs()
+            dims_error = (
+                torch.log(candidate_dims.clamp(min=0.01))
+                - torch.log(gt_dims[:, None, :])
+            ).abs().mean(dim=-1)
+            relative_rotation = torch.matmul(
+                candidate_pose.transpose(-1, -2),
+                gt_poses[:, None, :, :],
+            )
+            trace = relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            pose_error = 1.0 - ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+
+            if factor_weights is None:
+                factor_weights = {
+                    name: torch.ones_like(gt_z)
+                    for name in ("xy", "z", "dims", "pose")
+                }
+            oracle_cost = (
+                xy_error * factor_weights["xy"][:, None]
+                + z_error * factor_weights["z"][:, None]
+                + dims_error * factor_weights["dims"][:, None]
+                + pose_error * factor_weights["pose"][:, None]
+            )
+            selection_cost = (
+                geometry_cost
+                + self.geometry_oracle_weight * oracle_cost
+            )
+        else:
+            selection_cost = geometry_cost
+            xy_error = z_error = dims_error = pose_error = None
+
+        geometry_logits = (
+            hypothesis_quality - selection_cost
+        ) / max(self.geometry_selection_temperature, 1e-4)
+        best_index = selection_cost.detach().argmin(dim=1)
+        auxiliary_losses["quality"] = F.cross_entropy(
+            hypothesis_quality,
+            best_index,
+            reduction="none",
+        )
+        if self.training:
+            selection_weights = torch.softmax(geometry_logits, dim=1)
+        else:
+            # At inference the rendered geometry/depth closure is the actual
+            # verifier. The learned quality head is auxiliary and can become
+            # over-confident on degenerate thin/long boxes, so use the measured
+            # cost directly for hard selection.
+            selection_weights = F.one_hot(
+                best_index,
+                num_classes=hypotheses,
+            ).to(candidate_x.dtype)
+
+        selected_x = (selection_weights * candidate_x).sum(dim=1)
+        selected_y = (selection_weights * candidate_y).sum(dim=1)
+        selected_z = (selection_weights * candidate_z).sum(dim=1)
+        selected_dims = torch.exp(
+            (
+                selection_weights[:, :, None]
+                * torch.log(candidate_dims.clamp(min=0.01))
+            ).sum(dim=1)
+        ).clamp(
+            min=self.geometry_min_dimension,
+            max=self.geometry_max_dimension,
+        )
+        selected_yaw = (selection_weights * delta_yaw).sum(dim=1)
+        selected_pose = torch.matmul(
+            base_pose,
+            self.yaw_rotation_matrix(selected_yaw),
+        )
+        selected_quality = (
+            selection_weights * hypothesis_quality
+        ).sum(dim=1)
+        selected_log_variance = (
+            selection_weights[:, :, None] * hypothesis_log_variance
+        ).sum(dim=1)
+
+        if self.training and xy_error is not None:
+            selected_errors = torch.stack(
+                (
+                    (selection_weights * xy_error).sum(dim=1),
+                    (selection_weights * z_error).sum(dim=1),
+                    (selection_weights * dims_error).sum(dim=1),
+                    (selection_weights * pose_error).sum(dim=1),
+                ),
+                dim=1,
+            )
+            auxiliary_losses["uncertainty"] = (
+                F.softplus(
+                    torch.exp(-selected_log_variance) * selected_errors
+                    + selected_log_variance
+                )
+            ).mean(dim=1)
+        auxiliary_losses["closure"] = (
+            selection_weights * geometry_cost
+        ).sum(dim=1)
+        auxiliary_losses["projection"] = (
+            selection_weights * projection_cost
+        ).sum(dim=1)
+        auxiliary_losses["silhouette"] = (
+            selection_weights * silhouette_cost
+        ).sum(dim=1)
+        auxiliary_losses["depth"] = (
+            selection_weights * depth_cost
+        ).sum(dim=1)
+        auxiliary_losses["point"] = (
+            selection_weights * point_cost
+        ).sum(dim=1)
+        auxiliary_losses["ground"] = (
+            selection_weights * ground_cost
+        ).sum(dim=1)
+
+        selected_geometry_cost = (
+            selection_weights * geometry_cost
+        ).sum(dim=1)
+        geometry_confidence = (
+            torch.sigmoid(selected_quality)
+            * torch.exp(-F.softplus(selected_log_variance).mean(dim=1))
+            * torch.exp(-selected_geometry_cost.detach())
+        ).clamp(0.0, 1.0)
+        return (
+            selected_x,
+            selected_y,
+            selected_z,
+            selected_dims,
+            selected_pose,
+            geometry_confidence,
+            auxiliary_losses,
+            selected_geometry_cost,
+        )
+
     # optionally, scale proposals to zoom RoI in (<1.0) our out (>1.0)
     def scale_proposals(self, proposal_boxes):
         if self.scale_roi_boxes > 0:
@@ -424,8 +1114,17 @@ class ROIHeads3D_Text(StandardROIHeads):
 
         return proposal_boxes_scaled
     
-    def _forward_cube(self, features, instances, Ks, im_current_dims, im_scales_ratio, prompt_depth=None):
-        
+    def _forward_cube(
+        self,
+        features,
+        instances,
+        Ks,
+        im_current_dims,
+        im_scales_ratio,
+        prompt_depth=None,
+        prompt_ground=None,
+        image_tensor=None,
+    ):
         features = [features[f] for f in self.in_features]
 
         # training on foreground
@@ -451,10 +1150,27 @@ class ROIHeads3D_Text(StandardROIHeads):
             box_classes = (torch.cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0))
             gt_boxes3D = torch.cat([p.gt_boxes3D for p in proposals], dim=0,)
             gt_poses = torch.cat([p.gt_poses for p in proposals], dim=0,)
+            if len(proposals) and proposals[0].has("gt_render_masks"):
+                gt_render_masks = torch.cat(
+                    [p.gt_render_masks for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device)
+            else:
+                gt_render_masks = None
             if len(proposals) and proposals[0].has("gt_pseudo_weight"):
                 gt_pseudo_weight = torch.cat([p.gt_pseudo_weight for p in proposals], dim=0).to(gt_boxes3D.device)
             else:
                 gt_pseudo_weight = torch.ones_like(box_classes, dtype=torch.float32, device=gt_boxes3D.device)
+            gt_factor_weights = {}
+            for factor_name in ("xy", "z", "dims", "pose", "joint"):
+                field_name = f"gt_pseudo_weight_{factor_name}"
+                if len(proposals) and proposals[0].has(field_name):
+                    gt_factor_weights[factor_name] = torch.cat(
+                        [p.get(field_name) for p in proposals],
+                        dim=0,
+                    ).to(gt_boxes3D.device)
+                else:
+                    gt_factor_weights[factor_name] = gt_pseudo_weight
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
 
         # eval on all instances
@@ -464,22 +1180,119 @@ class ROIHeads3D_Text(StandardROIHeads):
             proposal_boxes = pred_boxes
             depth_target_boxes = None
             box_classes = torch.cat([x.pred_classes for x in instances])
+            if len(proposals) and proposals[0].has("render_masks"):
+                proposal_render_masks = torch.cat(
+                    [proposal.render_masks for proposal in proposals],
+                    dim=0,
+                ).to(box_classes.device)
+            else:
+                proposal_render_masks = None
 
         proposal_boxes_scaled = self.scale_proposals(proposal_boxes)
 
         # forward features
         point_map = None
-        if self.use_depth_roi and prompt_depth is not None:
-            Ks_scaled_per_image = torch.stack([
-                Ks[i] / im_scales_ratio[i] for i in range(len(Ks))
-            ]).to(features[0].device)
-            Ks_scaled_per_image[:, -1, -1] = 1
+        ray_map = None
+        Ks_scaled_per_image = torch.stack([
+            Ks[i] / im_scales_ratio[i] for i in range(len(Ks))
+        ]).to(features[0].device)
+        Ks_scaled_per_image[:, -1, -1] = 1
+        needs_geometry_maps = (
+            self.use_depth_roi
+            or self.use_geometry_interpreter
+            or self.use_differentiable_renderer
+        )
+        if needs_geometry_maps and prompt_depth is not None:
             point_map = depth_to_point_map(prompt_depth.tensor.to(features[0].device), Ks_scaled_per_image)
+            ray_map = build_ray_map(
+                prompt_depth.tensor.to(features[0].device),
+                Ks_scaled_per_image,
+            )
+        ground_planes_per_image = estimate_ground_planes(
+            point_map,
+            prompt_ground.tensor.to(features[0].device)
+            if prompt_ground is not None
+            else None,
+        )
 
         if self.use_depth_roi:
-            cube_features = self.cube_pooler(features, proposal_boxes_scaled, point_map).flatten(1)
+            cube_feature_map = self.cube_pooler(features, proposal_boxes_scaled, point_map)
         else:
-            cube_features = self.cube_pooler(features, proposal_boxes_scaled).flatten(1)
+            cube_feature_map = self.cube_pooler(features, proposal_boxes_scaled)
+
+        rsh_mask_logits = None
+        rsh_mask_prob = None
+        rsh_depth_masks_flat = None
+        if (
+            self.use_region_segmentation_head
+            and self.region_segmentation_head is not None
+        ):
+            cube_feature_map, rsh_mask_logits, rsh_mask_prob = (
+                self.region_segmentation_head(cube_feature_map)
+            )
+            if self.training and gt_render_masks is not None:
+                rsh_targets = F.interpolate(
+                    gt_render_masks[:, None].float(),
+                    size=rsh_mask_logits.shape[-2:],
+                    mode="nearest",
+                )
+                rsh_loss = F.binary_cross_entropy_with_logits(
+                    rsh_mask_logits,
+                    rsh_targets,
+                    reduction="none",
+                )
+                rsh_pixel_weight = 1.0 + 2.0 * rsh_targets
+                rsh_loss = (
+                    rsh_loss * rsh_pixel_weight
+                ).mean(dim=(1, 2, 3))
+                rsh_valid = rsh_targets.sum(dim=(1, 2, 3)) > 4.0
+                if gt_pseudo_weight.numel() == rsh_loss.numel():
+                    rsh_loss = rsh_loss * gt_pseudo_weight.to(rsh_loss.device).clamp(0.25, 1.0)
+                if rsh_valid.any():
+                    losses["Cube/loss_region_seg"] = (
+                        self.safely_reduce_losses(rsh_loss[rsh_valid])
+                        * self.loss_w_region_segmentation
+                        * self.loss_w_3d
+                    )
+
+                with torch.no_grad():
+                    rsh_prob_detached = rsh_mask_prob.detach()
+                    intersection = (
+                        rsh_prob_detached * rsh_targets
+                    ).sum(dim=(1, 2, 3))
+                    denominator = (
+                        rsh_prob_detached.sum(dim=(1, 2, 3))
+                        + rsh_targets.sum(dim=(1, 2, 3))
+                    ).clamp(min=1.0)
+                    rsh_quality = (
+                        (2.0 * intersection + 1.0)
+                        / (denominator + 1.0)
+                    ).clamp(0.05, 1.0)
+                    rsh_quality = torch.where(
+                        rsh_valid,
+                        rsh_quality,
+                        torch.ones_like(rsh_quality),
+                    )
+                    get_event_storage().put_scalar(
+                        "Cube/rsh_dice",
+                        rsh_quality[rsh_valid].mean().item() if rsh_valid.any() else 1.0,
+                        smoothing_hint=False,
+                    )
+                    if self.rsh_use_pseudo_weight:
+                        rsh_factor = (0.5 + 0.5 * rsh_quality).to(gt_boxes3D.device)
+                        for factor_name in ("z", "dims", "joint"):
+                            gt_factor_weights[factor_name] = (
+                                gt_factor_weights[factor_name] * rsh_factor
+                            ).clamp(0.05, 1.0)
+
+                if self.rsh_use_depth_guidance:
+                    rsh_depth_masks_flat = rsh_targets[:, 0].detach()
+            elif (not self.training) and rsh_mask_prob is not None:
+                if proposal_render_masks is None:
+                    proposal_render_masks = rsh_mask_prob[:, 0].detach()
+                if self.rsh_use_depth_guidance:
+                    rsh_depth_masks_flat = rsh_mask_prob[:, 0].detach()
+        cube_features = cube_feature_map.flatten(1)
 
         n = cube_features.shape[0]
         
@@ -489,6 +1302,61 @@ class ROIHeads3D_Text(StandardROIHeads):
 
         num_boxes_per_image = [len(i) for i in proposals]
 
+        hypothesis_deltas = None
+        hypothesis_quality = None
+        hypothesis_log_variance = None
+        explicit_geometry_anchor = None
+        dino_descriptor = None
+        prototype_confidence = None
+        point_roi = None
+        if self.use_geometry_interpreter:
+            if image_tensor is None:
+                raise RuntimeError("Geometry interpreter requires the detector image tensor.")
+            if point_map is None or ray_map is None:
+                spatial_shape = image_tensor.shape[-2:]
+                point_map = image_tensor.new_zeros(
+                    (image_tensor.shape[0], 3, *spatial_shape)
+                )
+                ray_map = build_ray_map(
+                    image_tensor.new_ones(
+                        (image_tensor.shape[0], 1, *spatial_shape)
+                    ),
+                    Ks_scaled_per_image,
+                )
+            dino_map, dino_spatial_scale = self.dino_encoder(image_tensor)
+            roi_size = cube_feature_map.shape[-1]
+            dino_roi = roi_align_map(
+                dino_map,
+                proposal_boxes_scaled,
+                roi_size,
+                spatial_scale=dino_spatial_scale,
+            )
+            point_roi = roi_align_map(
+                point_map,
+                proposal_boxes_scaled,
+                roi_size,
+                spatial_scale=1.0,
+            )
+            ray_roi = roi_align_map(
+                ray_map,
+                proposal_boxes_scaled,
+                roi_size,
+                spatial_scale=1.0,
+            )
+            (
+                hypothesis_deltas,
+                hypothesis_quality,
+                hypothesis_log_variance,
+                explicit_geometry_anchor,
+                dino_descriptor,
+                prototype_confidence,
+            ) = self.geometry_interpreter(
+                cube_feature_map,
+                dino_roi,
+                point_roi,
+                ray_roi,
+            )
+
         # scale the intrinsics according to the ratio the image has been scaled. 
         # this means the projections at the current scale are in sync.
         Ks_scaled_per_box = torch.cat([
@@ -496,6 +1364,19 @@ class ROIHeads3D_Text(StandardROIHeads):
             for (i, num) in enumerate(num_boxes_per_image)
         ]).to(cube_features.device)
         Ks_scaled_per_box[:, -1, -1] = 1
+        ground_planes_per_box = (
+            torch.cat(
+                [
+                    ground_planes_per_image[image_index : image_index + 1].repeat(
+                        num_boxes, 1
+                    )
+                    for image_index, num_boxes in enumerate(num_boxes_per_image)
+                ],
+                dim=0,
+            )
+            if ground_planes_per_image is not None
+            else None
+        )
 
         focal_lengths_per_box = torch.cat([
             (Ks[i][1, 1]).unsqueeze(0).repeat([num]) 
@@ -642,9 +1523,162 @@ class ROIHeads3D_Text(StandardROIHeads):
         if self.virtual_depth:
             cube_z = (cube_z * virtual_to_real)
 
-        if self.training:
+        geometry_confidence = None
+        geometry_cost = None
+        closure_boxes = depth_target_boxes if self.training else proposal_boxes
+        closure_roi_boxes = torch.cat(
+            [boxes.tensor for boxes in closure_boxes],
+            dim=0,
+        ).to(cube_z.device)
+        closure_observed_depth = None
+        if prompt_depth is not None:
+            closure_observed_depth = roi_align_map(
+                prompt_depth.tensor.to(cube_z.device),
+                closure_boxes,
+                self.render_size,
+                spatial_scale=1.0,
+            )[:, 0]
+        closure_target_silhouette = None
+        if self.training and gt_render_masks is not None:
+            closure_target_silhouette = F.interpolate(
+                gt_render_masks[:, None].float(),
+                size=(self.render_size, self.render_size),
+                mode="nearest",
+            )[:, 0]
+        elif not self.training and proposal_render_masks is not None:
+            closure_target_silhouette = F.interpolate(
+                proposal_render_masks[:, None].float(),
+                size=(self.render_size, self.render_size),
+                mode="nearest",
+            )[:, 0]
 
+        if (
+            self.training
+            and hypothesis_deltas is not None
+            and dino_descriptor is not None
+        ):
+            memory_confidence = gt_factor_weights["dims"]
+            if memory_confidence.numel() > self.shape_memory_max_updates:
+                memory_indices = memory_confidence.topk(
+                    self.shape_memory_max_updates
+                ).indices
+            else:
+                memory_indices = torch.arange(
+                    memory_confidence.numel(),
+                    device=memory_confidence.device,
+                )
+            self.geometry_interpreter.update_shape_memory(
+                dino_descriptor[memory_indices],
+                gt_boxes3D[memory_indices, 3:6],
+                memory_confidence[memory_indices],
+                self.shape_memory_min_confidence,
+            )
+
+        if (
+            not self.training
+            and hypothesis_deltas is not None
+            and self.geometry_apply_in_inference
+        ):
+            (
+                cube_x,
+                cube_y,
+                cube_z,
+                cube_dims,
+                cube_pose,
+                geometry_confidence,
+                _,
+                geometry_cost,
+            ) = self.apply_geometry_hypotheses(
+                cube_x,
+                cube_y,
+                cube_z,
+                cube_dims,
+                cube_pose,
+                src_widths,
+                src_heights,
+                hypothesis_deltas,
+                hypothesis_quality,
+                hypothesis_log_variance,
+                explicit_geometry_anchor,
+                Ks_scaled_per_box,
+                closure_roi_boxes,
+                point_roi,
+                target_silhouette=closure_target_silhouette,
+                observed_depth_roi=closure_observed_depth,
+                ground_planes=ground_planes_per_box,
+            )
+
+        if self.training:
             prefix = 'Cube/'
+            if hypothesis_deltas is not None:
+                (
+                    geometry_cube_x,
+                    geometry_cube_y,
+                    geometry_cube_z,
+                    geometry_cube_dims,
+                    geometry_cube_pose,
+                    geometry_confidence,
+                    hypothesis_losses,
+                    geometry_cost,
+                ) = self.apply_geometry_hypotheses(
+                    cube_x,
+                    cube_y,
+                    cube_z,
+                    cube_dims,
+                    cube_pose,
+                    src_widths,
+                    src_heights,
+                    hypothesis_deltas,
+                    hypothesis_quality,
+                    hypothesis_log_variance,
+                    explicit_geometry_anchor,
+                    Ks_scaled_per_box,
+                    closure_roi_boxes,
+                    point_roi,
+                    target_silhouette=closure_target_silhouette,
+                    observed_depth_roi=closure_observed_depth,
+                    ground_planes=ground_planes_per_box,
+                    gt_boxes3D=gt_boxes3D,
+                    gt_poses=gt_poses,
+                    factor_weights=gt_factor_weights,
+                )
+                if self.geometry_apply_to_prediction:
+                    cube_x = geometry_cube_x
+                    cube_y = geometry_cube_y
+                    cube_z = geometry_cube_z
+                    cube_dims = geometry_cube_dims
+                    cube_pose = geometry_cube_pose
+                if self.loss_w_multi_hypothesis > 0:
+                    losses[prefix + 'loss_hypothesis_quality'] = (
+                        self.safely_reduce_losses(hypothesis_losses["quality"])
+                        * self.loss_w_multi_hypothesis
+                        * self.loss_w_3d
+                    )
+                    losses[prefix + 'loss_hypothesis_uncertainty'] = (
+                        self.safely_reduce_losses(hypothesis_losses["uncertainty"])
+                        * self.loss_w_multi_hypothesis
+                        * self.loss_w_3d
+                    )
+                if self.loss_w_geometry_closure > 0:
+                    losses[prefix + 'loss_geometry_closure'] = (
+                        self.safely_reduce_losses(hypothesis_losses["closure"])
+                        * self.loss_w_geometry_closure
+                        * self.loss_w_3d
+                    )
+                storage = get_event_storage()
+                for component_name in (
+                    "projection",
+                    "silhouette",
+                    "depth",
+                    "point",
+                    "ground",
+                ):
+                    storage.put_scalar(
+                        prefix + "closure_" + component_name,
+                        hypothesis_losses[component_name].mean().item(),
+                        smoothing_hint=False,
+                    )
+
             storage = get_event_storage()
 
             # Pull off necessary GT information
@@ -665,6 +1699,109 @@ class ROIHeads3D_Text(StandardROIHeads):
 
             # These are the corners which will be the target for all losses!!
             gt_corners = util.get_cuboid_verts_faces(gt_box3d, gt_poses)[0]
+
+            if (
+                self.use_differentiable_renderer
+                and self.soft_renderer is not None
+                and gt_render_masks is not None
+                and prompt_depth is not None
+            ):
+                pred_x3d_render = cube_z * (
+                    cube_x - Ks_scaled_per_box[:, 0, 2]
+                ) / Ks_scaled_per_box[:, 0, 0]
+                pred_y3d_render = cube_z * (
+                    cube_y - Ks_scaled_per_box[:, 1, 2]
+                ) / Ks_scaled_per_box[:, 1, 1]
+                pred_box3d_render = torch.cat(
+                    (
+                        torch.stack(
+                            (pred_x3d_render, pred_y3d_render, cube_z),
+                            dim=1,
+                        ),
+                        cube_dims,
+                    ),
+                    dim=1,
+                )
+                pred_corners_render = util.get_cuboid_verts_faces(
+                    pred_box3d_render,
+                    cube_pose,
+                )[0]
+                render_boxes = torch.cat(
+                    [boxes.tensor for boxes in depth_target_boxes],
+                    dim=0,
+                ).to(cube_z.device)
+                rendered_silhouette, rendered_depth = self.soft_renderer(
+                    pred_corners_render,
+                    Ks_scaled_per_box,
+                    render_boxes,
+                )
+                target_silhouette = F.interpolate(
+                    gt_render_masks[:, None].float(),
+                    size=(self.render_size, self.render_size),
+                    mode="nearest",
+                )[:, 0]
+                silhouette_intersection = (
+                    rendered_silhouette * target_silhouette
+                ).sum(dim=(1, 2))
+                silhouette_denominator = (
+                    rendered_silhouette.sum(dim=(1, 2))
+                    + target_silhouette.sum(dim=(1, 2))
+                ).clamp(min=1.0)
+                loss_render_silhouette = (
+                    1.0
+                    - (2.0 * silhouette_intersection + 1.0)
+                    / (silhouette_denominator + 1.0)
+                )
+                if self.use_factorized_pseudo_weight:
+                    loss_render_silhouette = (
+                        loss_render_silhouette
+                        * gt_factor_weights["dims"].to(loss_render_silhouette.device)
+                    )
+                losses[prefix + "loss_render_silhouette"] = (
+                    self.safely_reduce_losses(loss_render_silhouette)
+                    * self.loss_w_render_silhouette
+                    * self.loss_w_3d
+                )
+
+                observed_depth_roi = roi_align_map(
+                    prompt_depth.tensor.to(cube_z.device),
+                    depth_target_boxes,
+                    self.render_size,
+                    spatial_scale=1.0,
+                )[:, 0]
+                valid_depth = (
+                    torch.isfinite(observed_depth_roi)
+                    & (observed_depth_roi > 0.05)
+                    & (target_silhouette > 0.5)
+                )
+                depth_residual = F.smooth_l1_loss(
+                    torch.log(rendered_depth.clamp(0.05, 80.0)),
+                    torch.log(observed_depth_roi.clamp(0.05, 80.0)),
+                    reduction="none",
+                    beta=0.05,
+                )
+                depth_weight = (
+                    valid_depth.float() * rendered_silhouette.detach()
+                )
+                depth_count = depth_weight.sum(dim=(1, 2)).clamp(min=1.0)
+                loss_render_depth = (
+                    depth_residual * depth_weight
+                ).sum(dim=(1, 2)) / depth_count
+                if self.use_factorized_pseudo_weight:
+                    loss_render_depth = (
+                        loss_render_depth
+                        * gt_factor_weights["z"].to(loss_render_depth.device)
+                    )
+                losses[prefix + "loss_render_depth"] = (
+                    self.safely_reduce_losses(loss_render_depth)
+                    * self.loss_w_render_depth
+                    * self.loss_w_3d
+                )
+                storage.put_scalar(
+                    prefix + "render_valid_depth",
+                    valid_depth.float().mean().item(),
+                    smoothing_hint=False,
+                )
 
             # project GT corners
             gt_proj_boxes = torch.bmm(Ks_scaled_per_box, gt_corners.transpose(1,2))
@@ -875,20 +2012,72 @@ class ROIHeads3D_Text(StandardROIHeads):
 
                 storage.put_scalar(prefix + 'pseudo_weight', gt_pseudo_weight.mean().item(), smoothing_hint=False)
 
+            if self.use_factorized_pseudo_weight and gt_factor_weights["dims"].numel() > 0:
+                factor_weights = {
+                    name: values.to(loss_dims.device).clamp(0.05, 1.0)
+                    for name, values in gt_factor_weights.items()
+                }
+                loss_dims = loss_dims * factor_weights["dims"]
+                if cube_2d_deltas is not None:
+                    loss_xy = loss_xy * factor_weights["xy"]
+                if loss_z is not None:
+                    loss_z = loss_z * factor_weights["z"]
+                if loss_pose is not None:
+                    loss_pose = loss_pose * factor_weights["pose"]
+                if self.loss_w_joint > 0:
+                    loss_joint = loss_joint * factor_weights["joint"]
+                for factor_name, factor_weight in factor_weights.items():
+                    storage.put_scalar(
+                        prefix + f'pseudo_weight_{factor_name}',
+                        factor_weight.mean().item(),
+                        smoothing_hint=False,
+                    )
+
             if (
                 self.use_depth_consistency_loss
                 and self.loss_w_depth_consistency > 0
                 and prompt_depth is not None
                 and loss_z is not None
             ):
+                depth_masks_per_image = None
+                if (
+                    self.rsh_use_depth_guidance
+                    and rsh_depth_masks_flat is not None
+                    and rsh_depth_masks_flat.shape[0] == cube_z.numel()
+                ):
+                    depth_masks_per_image = list(
+                        rsh_depth_masks_flat.split(num_boxes_per_image)
+                    )
                 depth_targets, depth_valid = self.depth_targets_from_boxes(
                     prompt_depth.tensor.to(cube_z.device),
                     depth_target_boxes,
                     device=cube_z.device,
+                    masks_per_image=depth_masks_per_image,
                 )
                 if depth_valid.numel() == cube_z.numel() and depth_valid.any():
                     depth_targets = depth_targets[depth_valid].clamp(0.05, 80.0)
-                    pred_depth = cube_z[depth_valid].clamp(0.05, 80.0)
+                    if self.depth_consistency_mode == "front_surface":
+                        pred_x3d = cube_z * (
+                            cube_x - Ks_scaled_per_box[:, 0, 2]
+                        ) / Ks_scaled_per_box[:, 0, 0]
+                        pred_y3d = cube_z * (
+                            cube_y - Ks_scaled_per_box[:, 1, 2]
+                        ) / Ks_scaled_per_box[:, 1, 1]
+                        pred_boxes_3d = torch.cat(
+                            (
+                                torch.stack((pred_x3d, pred_y3d, cube_z)).T,
+                                cube_dims,
+                            ),
+                            dim=1,
+                        )
+                        pred_corners = util.get_cuboid_verts_faces(
+                            pred_boxes_3d,
+                            cube_pose,
+                        )[0]
+                        pred_depth_all = pred_corners[:, :, 2].min(dim=1)[0]
+                    else:
+                        pred_depth_all = cube_z
+                    pred_depth = pred_depth_all[depth_valid].clamp(0.05, 80.0)
                     loss_depth_consistency = F.smooth_l1_loss(
                         torch.log(pred_depth),
                         torch.log(depth_targets),
@@ -959,14 +2148,29 @@ class ROIHeads3D_Text(StandardROIHeads):
         cube_3D = cube_3D.split(num_boxes_per_image)
         cube_pose = cube_pose.split(num_boxes_per_image)
         box_classes = box_classes.split(num_boxes_per_image)
+        geometry_confidence_split = (
+            geometry_confidence.split(num_boxes_per_image)
+            if geometry_confidence is not None
+            else [None] * len(num_boxes_per_image)
+        )
+        geometry_cost_split = (
+            geometry_cost.split(num_boxes_per_image)
+            if geometry_cost is not None
+            else [None] * len(num_boxes_per_image)
+        )
+        rsh_mask_split = (
+            rsh_mask_prob[:, 0].detach().split(num_boxes_per_image)
+            if rsh_mask_prob is not None
+            else [None] * len(num_boxes_per_image)
+        )
         
         pred_instances = None
         
         pred_instances = instances if not self.training else \
             [Instances(image_size) for image_size in im_current_dims]
 
-        for cube_3D_i, cube_pose_i, instances_i, K, im_dim, im_scale_ratio, box_classes_i, pred_boxes_i in \
-            zip(cube_3D, cube_pose, pred_instances, Ks, im_current_dims, im_scales_ratio, box_classes, pred_boxes):
+        for cube_3D_i, cube_pose_i, geometry_confidence_i, geometry_cost_i, rsh_mask_i, instances_i, K, im_dim, im_scale_ratio, box_classes_i, pred_boxes_i in \
+            zip(cube_3D, cube_pose, geometry_confidence_split, geometry_cost_split, rsh_mask_split, pred_instances, Ks, im_current_dims, im_scales_ratio, box_classes, pred_boxes):
             
             # merge scores if they already exist
             if hasattr(instances_i, 'scores'):
@@ -989,6 +2193,14 @@ class ROIHeads3D_Text(StandardROIHeads):
             instances_i.pred_center_2D = cube_3D_i[:, 6:8]
             instances_i.pred_dimensions = cube_3D_i[:, 3:6]
             instances_i.pred_pose = cube_pose_i
+            if geometry_confidence_i is not None:
+                instances_i.pred_geometry_confidence = geometry_confidence_i
+            if geometry_cost_i is not None:
+                instances_i.pred_geometry_score = torch.exp(
+                    -geometry_cost_i.detach()
+                ).clamp(0.0, 1.0)
+            if rsh_mask_i is not None:
+                instances_i.pred_region_masks = rsh_mask_i
 
         if self.training:
             return pred_instances, losses
@@ -1100,7 +2312,13 @@ class ROIHeads3D_Text(StandardROIHeads):
 
         return proposals_with_gt
 
-    def depth_targets_from_boxes(self, depth, boxes_per_image, device=None):
+    def depth_targets_from_boxes(
+        self,
+        depth,
+        boxes_per_image,
+        device=None,
+        masks_per_image=None,
+    ):
         if depth is None or boxes_per_image is None:
             empty = torch.empty(0, device=device)
             return empty, empty.bool()
@@ -1124,7 +2342,11 @@ class ROIHeads3D_Text(StandardROIHeads):
                 depth_i = depth[img_idx, 0]
                 height, width = depth_i.shape[-2:]
 
-                for box in boxes.tensor.to(depth_i.device):
+                masks_i = None
+                if masks_per_image is not None and img_idx < len(masks_per_image):
+                    masks_i = masks_per_image[img_idx].to(depth_i.device)
+
+                for box_idx, box in enumerate(boxes.tensor.to(depth_i.device)):
                     x1, y1, x2, y2 = box.unbind()
 
                     if crop_ratio < 1.0:
@@ -1148,13 +2370,39 @@ class ROIHeads3D_Text(StandardROIHeads):
                         continue
 
                     patch = depth_i[yi1:yi2, xi1:xi2]
-                    values = patch[torch.isfinite(patch) & (patch > 0.05)]
+                    full_values = patch[torch.isfinite(patch) & (patch > 0.05)]
+                    values = full_values
+                    if masks_i is not None and box_idx < masks_i.shape[0]:
+                        mask = masks_i[box_idx].float()
+                        if mask.dim() == 3:
+                            mask = mask[0]
+                        mask = F.interpolate(
+                            mask[None, None],
+                            size=patch.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )[0, 0]
+                        mask_valid = mask > self.rsh_depth_mask_threshold
+                        masked_values = patch[
+                            mask_valid
+                            & torch.isfinite(patch)
+                            & (patch > 0.05)
+                        ]
+                        if masked_values.numel() >= self.depth_consistency_min_pixels:
+                            values = masked_values
 
                     if values.numel() < self.depth_consistency_min_pixels:
                         targets.append(depth_i.new_tensor(0.0))
                         valid.append(False)
                     else:
-                        targets.append(values.median())
+                        if self.depth_consistency_mode == "front_surface":
+                            quantile = min(
+                                max(self.depth_consistency_percentile, 0.05),
+                                0.50,
+                            )
+                            targets.append(torch.quantile(values, quantile))
+                        else:
+                            targets.append(values.median())
                         valid.append(True)
 
         if len(targets) == 0:

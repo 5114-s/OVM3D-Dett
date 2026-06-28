@@ -155,6 +155,12 @@ def parse_args():
     parser.add_argument("--surface_prior_weight", type=float, default=0.15)
     parser.add_argument("--surface_min_point_support", type=float, default=0.25)
     parser.add_argument("--surface_min_support_ratio", type=float, default=0.75)
+    parser.add_argument("--use_latent_box_closure", action="store_true")
+    parser.add_argument("--latent_topk", type=int, default=8)
+    parser.add_argument("--latent_temperature", type=float, default=0.25)
+    parser.add_argument("--latent_min_attribute_weight", type=float, default=0.15)
+    parser.add_argument("--latent_max_attribute_weight", type=float, default=1.0)
+    parser.add_argument("--latent_store_candidates", action="store_true")
 
     parser.add_argument("--reference_min_iou", type=float, default=0.10)
     parser.add_argument("--min_weight", type=float, default=0.35)
@@ -756,6 +762,148 @@ def point_support_3d(
     return float(np.mean(np.all(np.abs(local) <= half_obj.reshape(1, 3), axis=1)))
 
 
+def clamp_weight(value: float, args) -> float:
+    return float(
+        np.clip(
+            value,
+            float(args.latent_min_attribute_weight),
+            float(args.latent_max_attribute_weight),
+        )
+    )
+
+
+def circular_concentration(angles: np.ndarray, weights: np.ndarray) -> float:
+    if angles.size == 0:
+        return 0.0
+    # Upright cuboids are pi-periodic in yaw.
+    vector = np.sum(weights * np.exp(2j * angles))
+    return float(np.clip(np.abs(vector), 0.0, 1.0))
+
+
+def latent_candidate_statistics(candidates: List[dict], args) -> dict:
+    if not candidates:
+        return {}
+
+    candidates = sorted(candidates, key=lambda item: item["loss"])
+    topk = candidates[: max(1, int(args.latent_topk))]
+    losses = np.asarray([item["loss"] for item in topk], dtype=np.float64)
+    temperature = max(float(args.latent_temperature), 1e-4)
+    logits = -(losses - losses.min()) / temperature
+    logits -= logits.max()
+    posterior = np.exp(logits)
+    posterior /= max(float(posterior.sum()), 1e-12)
+
+    centers = np.stack([item["center"] for item in topk], axis=0)
+    log_dims = np.log(
+        np.maximum(np.stack([item["dims"] for item in topk], axis=0), 1e-4)
+    )
+    yaw_offsets = np.asarray([item["yaw_offset"] for item in topk], dtype=np.float64)
+    center_mean = np.sum(centers * posterior[:, None], axis=0)
+    log_dims_mean = np.sum(log_dims * posterior[:, None], axis=0)
+    center_std = np.sqrt(
+        np.sum(((centers - center_mean) ** 2) * posterior[:, None], axis=0)
+    )
+    dims_log_std = np.sqrt(
+        np.sum(((log_dims - log_dims_mean) ** 2) * posterior[:, None], axis=0)
+    )
+
+    best = topk[0]
+    margin = float(losses[1] - losses[0]) if losses.size > 1 else temperature
+    margin_conf = float(1.0 - math.exp(-max(margin, 0.0) / temperature))
+    effective_count = float(1.0 / max(np.sum(posterior**2), 1e-12))
+    posterior_conf = float(
+        np.clip(
+            1.0 - (effective_count - 1.0) / max(len(topk) - 1, 1),
+            0.0,
+            1.0,
+        )
+    )
+    mode_conf = 0.5 * margin_conf + 0.5 * posterior_conf
+
+    bbox_conf = float(np.clip(best["bbox_iou"], 0.0, 1.0))
+    silhouette_conf = float(np.clip(best["silhouette_iou"], 0.0, 1.0))
+    depth_conf = float(math.exp(-3.0 * min(float(best["depth_error"]), 2.0)))
+    support_conf = float(np.clip(best["support"], 0.0, 1.0))
+    prior_conf = float(math.exp(-min(float(best["prior_error"]), 3.0)))
+    yaw_conf = circular_concentration(yaw_offsets, posterior)
+
+    center_xy_stability = float(math.exp(-8.0 * np.linalg.norm(center_std[:2])))
+    center_z_stability = float(math.exp(-8.0 * center_std[2]))
+    dims_stability = float(math.exp(-6.0 * float(np.mean(dims_log_std))))
+
+    weight_xy = clamp_weight(
+        0.35 * bbox_conf
+        + 0.25 * silhouette_conf
+        + 0.20 * support_conf
+        + 0.10 * center_xy_stability
+        + 0.10 * mode_conf,
+        args,
+    )
+    weight_z = clamp_weight(
+        0.50 * depth_conf
+        + 0.25 * support_conf
+        + 0.15 * center_z_stability
+        + 0.10 * mode_conf,
+        args,
+    )
+    weight_dims = clamp_weight(
+        0.30 * silhouette_conf
+        + 0.30 * support_conf
+        + 0.15 * prior_conf
+        + 0.15 * dims_stability
+        + 0.10 * mode_conf,
+        args,
+    )
+    weight_pose = clamp_weight(
+        0.35 * silhouette_conf
+        + 0.25 * support_conf
+        + 0.25 * yaw_conf
+        + 0.15 * mode_conf,
+        args,
+    )
+    weight_joint = clamp_weight(
+        float(np.exp(np.mean(np.log(np.maximum(
+            [weight_xy, weight_z, weight_dims, weight_pose],
+            1e-4,
+        ))))),
+        args,
+    )
+
+    result = {
+        "latent_box_enabled": True,
+        "latent_box_candidate_count": int(len(candidates)),
+        "latent_box_topk": int(len(topk)),
+        "latent_box_loss_margin": margin,
+        "latent_box_mode_confidence": mode_conf,
+        "latent_box_effective_count": effective_count,
+        "latent_box_center_std": [float(v) for v in center_std],
+        "latent_box_dims_log_std": [float(v) for v in dims_log_std],
+        "latent_box_yaw_concentration": yaw_conf,
+        "pseudo_weight_xy": weight_xy,
+        "pseudo_weight_z": weight_z,
+        "pseudo_weight_dims": weight_dims,
+        "pseudo_weight_pose": weight_pose,
+        "pseudo_weight_joint": weight_joint,
+        "pseudo_weight": weight_joint,
+    }
+    if args.latent_store_candidates:
+        result["latent_box_candidates"] = [
+            {
+                "loss": float(item["loss"]),
+                "center_cam": [float(v) for v in item["center"]],
+                "dimensions": [float(v) for v in item["dims"]],
+                "yaw_offset": float(item["yaw_offset"]),
+                "bbox_iou": float(item["bbox_iou"]),
+                "silhouette_iou": float(item["silhouette_iou"]),
+                "depth_rel_error": float(item["depth_error"]),
+                "point_support": float(item["support"]),
+                "posterior": float(posterior[index]),
+            }
+            for index, item in enumerate(topk)
+        ]
+    return result
+
+
 def optimize_box_surface_consistency(
     fit,
     points_cam: np.ndarray,
@@ -771,6 +919,7 @@ def optimize_box_surface_consistency(
         "surface_opt_enabled": bool(args.use_surface_box_optimization),
         "surface_opt_applied": False,
         "surface_opt_candidates": 0,
+        "latent_box_enabled": bool(args.use_latent_box_closure),
     }
     if not args.use_surface_box_optimization:
         return fit, metrics
@@ -836,6 +985,7 @@ def optimize_box_surface_consistency(
     )
 
     best = None
+    valid_candidates = []
     for yaw_offset in yaw_values:
         R_candidate = R_base @ rotate_y(yaw_offset)
         for scale_w in scale_values:
@@ -901,24 +1051,27 @@ def optimize_box_surface_consistency(
                                 + 0.10 * ground_error
                             )
                             metrics["surface_opt_candidates"] += 1
+                            candidate = {
+                                "loss": loss,
+                                "vertices": vertices_candidate,
+                                "center": center_candidate,
+                                "dims": dims_candidate,
+                                "R": R_candidate,
+                                "bbox_iou": bbox_score,
+                                "silhouette_iou": silhouette_score,
+                                "depth_error": depth_error,
+                                "support": support,
+                                "prior_error": prior_error,
+                                "front_depth": front_depth,
+                                "depth_blend": depth_blend,
+                                "xy_blend": xy_blend,
+                                "scale_dims": [scale_w, scale_h, scale_l],
+                                "yaw_offset": yaw_offset,
+                            }
+                            if args.use_latent_box_closure:
+                                valid_candidates.append(candidate)
                             if best is None or loss < best["loss"]:
-                                best = {
-                                    "loss": loss,
-                                    "vertices": vertices_candidate,
-                                    "center": center_candidate,
-                                    "dims": dims_candidate,
-                                    "R": R_candidate,
-                                    "bbox_iou": bbox_score,
-                                    "silhouette_iou": silhouette_score,
-                                    "depth_error": depth_error,
-                                    "support": support,
-                                    "prior_error": prior_error,
-                                    "front_depth": front_depth,
-                                    "depth_blend": depth_blend,
-                                    "xy_blend": xy_blend,
-                                    "scale_dims": [scale_w, scale_h, scale_l],
-                                    "yaw_offset": yaw_offset,
-                                }
+                                best = candidate
 
     if best is None:
         metrics["surface_opt_reason"] = "no_candidate"
@@ -947,6 +1100,8 @@ def optimize_box_surface_consistency(
             "surface_opt_yaw_offset": float(best["yaw_offset"]),
         }
     )
+    if args.use_latent_box_closure:
+        metrics.update(latent_candidate_statistics(valid_candidates, args))
     return (
         best["vertices"].astype(np.float32),
         best["center"].astype(np.float32),
@@ -1378,7 +1533,7 @@ def main():
                 stats["unknown_category"] += 1
             score = float(np.asarray(scores[j]).reshape(-1)[0])
             bbox = normalize_bbox_to_pixels(boxes[j], width, height)
-            extra = {}
+            extra = {"pseudo_mask_index": int(j)}
             source_anchor, source_anchor_iou = match_source_anchor(
                 source_anchor_index,
                 used_anchor_ids,
@@ -1497,6 +1652,22 @@ def main():
                     args,
                 )
                 extra.update(surface_metrics)
+                if (
+                    args.use_latent_box_closure
+                    and "pseudo_weight_joint" not in extra
+                ):
+                    fallback_weight = clamp_weight(0.35, args)
+                    extra.update(
+                        {
+                            "latent_box_fallback": True,
+                            "pseudo_weight_xy": fallback_weight,
+                            "pseudo_weight_z": fallback_weight,
+                            "pseudo_weight_dims": fallback_weight,
+                            "pseudo_weight_pose": fallback_weight,
+                            "pseudo_weight_joint": fallback_weight,
+                            "pseudo_weight": fallback_weight,
+                        }
+                    )
                 stats["valid3d"] += 1
                 ann = build_valid_annotation(
                     ann_id,

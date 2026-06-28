@@ -404,6 +404,9 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
         "bbox", "bbox3D_cam", "bbox2D_proj", "bbox2D_trunc", "bbox2D_tight", 
         "center_cam", "dimensions", "pose", "R_cam", "category_id",
         "pseudo_weight", "ng_consistency_score",
+        "pseudo_weight_xy", "pseudo_weight_z", "pseudo_weight_dims",
+        "pseudo_weight_pose", "pseudo_weight_joint",
+        "pseudo_mask_index",
     ]
     
     # optional per image keys to pass if exists

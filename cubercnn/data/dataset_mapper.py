@@ -4,6 +4,7 @@ import os
 import torch
 import numpy as np
 import cv2
+import torch.nn.functional as F
 from detectron2.structures import BoxMode, Keypoints
 from detectron2.data import detection_utils
 from detectron2.data import transforms as T
@@ -22,6 +23,20 @@ class DatasetMapper3D(DatasetMapper):
         super().__init__(cfg, is_train=is_train)
         self.use_depth = bool(getattr(cfg.INPUT, "USE_DEPTH", False))
         self.depth_root = str(getattr(cfg.INPUT, "DEPTH_ROOT", ""))
+        self.depth_allow_sensor_fallback = bool(
+            getattr(cfg.INPUT, "DEPTH_ALLOW_SENSOR_FALLBACK", True)
+        )
+        self.use_pseudo_mask = bool(getattr(cfg.INPUT, "USE_PSEUDO_MASK", False))
+        self.pseudo_mask_root = str(getattr(cfg.INPUT, "PSEUDO_MASK_ROOT", ""))
+        self.pseudo_mask_size = int(getattr(cfg.INPUT, "PSEUDO_MASK_SIZE", 28))
+        self.pseudo_mask_match_iou_threshold = float(
+            getattr(cfg.INPUT, "PSEUDO_MASK_MATCH_IOU_THRESHOLD", 0.05)
+        )
+        self.pseudo_mask_allow_reuse = bool(
+            getattr(cfg.INPUT, "PSEUDO_MASK_ALLOW_REUSE", False)
+        )
+        self.use_ground_mask = bool(getattr(cfg.INPUT, "USE_GROUND_MASK", False))
+        self.ground_mask_root = str(getattr(cfg.INPUT, "GROUND_MASK_ROOT", ""))
 
     def __call__(self, dataset_dict):
         
@@ -30,6 +45,16 @@ class DatasetMapper3D(DatasetMapper):
         image = detection_utils.read_image(dataset_dict["file_name"], format=self.image_format)
         detection_utils.check_image_size(dataset_dict, image)
         depth = self._load_depth(dataset_dict, image.shape[:2]) if self.use_depth else None
+        pseudo_masks = (
+            self._load_pseudo_masks(dataset_dict, image.shape[:2])
+            if self.use_pseudo_mask
+            else None
+        )
+        ground_mask = (
+            self._load_ground_mask(dataset_dict, image.shape[:2])
+            if self.use_ground_mask
+            else None
+        )
 
         aug_input = T.AugInput(image)
         transforms = self.augmentations(aug_input)
@@ -38,6 +63,17 @@ class DatasetMapper3D(DatasetMapper):
             depth = transforms.apply_image(depth[:, :, None])[:, :, 0]
             depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
             depth = np.maximum(depth, 0.0).astype(np.float32)
+        if pseudo_masks is not None:
+            transformed_masks = []
+            for pseudo_mask in pseudo_masks:
+                transformed_masks.append(
+                    transforms.apply_segmentation(pseudo_mask.astype(np.uint8)) > 0
+                )
+            pseudo_masks = np.asarray(transformed_masks, dtype=np.uint8)
+        if ground_mask is not None:
+            ground_mask = (
+                transforms.apply_segmentation(ground_mask.astype(np.uint8)) > 0
+            ).astype(np.float32)
 
         image_shape = image.shape[:2]  # h, w
 
@@ -47,6 +83,10 @@ class DatasetMapper3D(DatasetMapper):
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
         if depth is not None:
             dataset_dict["depth"] = torch.as_tensor(np.ascontiguousarray(depth[None, :, :]))
+        if ground_mask is not None:
+            dataset_dict["ground_mask"] = torch.as_tensor(
+                np.ascontiguousarray(ground_mask[None, :, :])
+            )
 
         # no need for additoinal processing at inference
         if not self.is_train:
@@ -64,12 +104,123 @@ class DatasetMapper3D(DatasetMapper):
                 transform_instance_annotations(obj, transforms, K=K)
                 for obj in dataset_dict.pop("annotations") if obj.get("iscrowd", 0) == 0
             ]
+            if pseudo_masks is not None:
+                self._attach_render_masks(annos, pseudo_masks, image_shape)
 
             # convert to instance format
             instances = annotations_to_instances(annos, image_shape, unknown_categories)
             dataset_dict["instances"] = detection_utils.filter_empty_instances(instances)
 
         return dataset_dict
+
+    def _attach_render_masks(self, annos, pseudo_masks, image_shape):
+        height, width = image_shape
+        matched_indices = self._match_pseudo_masks_to_annos(
+            annos, pseudo_masks, image_shape
+        )
+        for annotation, matched_index in zip(annos, matched_indices):
+            mask_index = int(annotation.get("pseudo_mask_index", -1))
+            if not (0 <= mask_index < len(pseudo_masks)):
+                mask_index = matched_index
+
+            if 0 <= mask_index < len(pseudo_masks):
+                mask = pseudo_masks[mask_index]
+            else:
+                mask = np.zeros((height, width), dtype=np.uint8)
+
+            box = BoxMode.convert(
+                annotation["bbox"],
+                annotation["bbox_mode"],
+                BoxMode.XYXY_ABS,
+            )
+            x1, y1, x2, y2 = [float(value) for value in box]
+            ix1 = int(np.floor(np.clip(x1, 0, max(width - 1, 0))))
+            iy1 = int(np.floor(np.clip(y1, 0, max(height - 1, 0))))
+            ix2 = int(np.ceil(np.clip(x2, ix1 + 1, width)))
+            iy2 = int(np.ceil(np.clip(y2, iy1 + 1, height)))
+            crop = mask[iy1:iy2, ix1:ix2]
+            if crop.size == 0:
+                crop = np.zeros((1, 1), dtype=np.uint8)
+            crop_tensor = torch.as_tensor(crop[None, None].astype(np.float32))
+            resized = F.interpolate(
+                crop_tensor,
+                size=(self.pseudo_mask_size, self.pseudo_mask_size),
+                mode="nearest",
+            )[0, 0]
+            annotation["render_mask"] = resized.numpy().astype(np.float32)
+
+    def _match_pseudo_masks_to_annos(self, annos, pseudo_masks, image_shape):
+        if pseudo_masks is None or len(pseudo_masks) == 0 or len(annos) == 0:
+            return [-1 for _ in annos]
+
+        mask_boxes = self._mask_boxes_xyxy(pseudo_masks, image_shape)
+        if len(mask_boxes) == 0:
+            return [-1 for _ in annos]
+
+        height, width = image_shape
+        anno_boxes = []
+        for annotation in annos:
+            box = BoxMode.convert(
+                annotation["bbox"],
+                annotation["bbox_mode"],
+                BoxMode.XYXY_ABS,
+            )
+            x1, y1, x2, y2 = [float(value) for value in box]
+            anno_boxes.append(
+                [
+                    np.clip(x1, 0.0, float(width)),
+                    np.clip(y1, 0.0, float(height)),
+                    np.clip(x2, 0.0, float(width)),
+                    np.clip(y2, 0.0, float(height)),
+                ]
+            )
+        anno_boxes = np.asarray(anno_boxes, dtype=np.float32)
+
+        ious = self._pairwise_iou_xyxy(anno_boxes, mask_boxes)
+        matched = [-1 for _ in annos]
+        used_masks = set()
+        for anno_idx in np.argsort(-ious.max(axis=1)):
+            for mask_idx in np.argsort(-ious[anno_idx]):
+                mask_idx = int(mask_idx)
+                if not self.pseudo_mask_allow_reuse and mask_idx in used_masks:
+                    continue
+                if ious[anno_idx, mask_idx] < self.pseudo_mask_match_iou_threshold:
+                    break
+                matched[int(anno_idx)] = mask_idx
+                used_masks.add(mask_idx)
+                break
+        return matched
+
+    def _mask_boxes_xyxy(self, masks, image_shape):
+        height, width = image_shape
+        boxes = []
+        for mask in masks:
+            ys, xs = np.nonzero(mask > 0)
+            if len(xs) == 0 or len(ys) == 0:
+                boxes.append([0.0, 0.0, 0.0, 0.0])
+                continue
+            x1 = float(np.clip(xs.min(), 0, max(width - 1, 0)))
+            y1 = float(np.clip(ys.min(), 0, max(height - 1, 0)))
+            x2 = float(np.clip(xs.max() + 1, 0, width))
+            y2 = float(np.clip(ys.max() + 1, 0, height))
+            boxes.append([x1, y1, x2, y2])
+        return np.asarray(boxes, dtype=np.float32)
+
+    def _pairwise_iou_xyxy(self, boxes1, boxes2):
+        if len(boxes1) == 0 or len(boxes2) == 0:
+            return np.zeros((len(boxes1), len(boxes2)), dtype=np.float32)
+        lt = np.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+        rb = np.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+        wh = np.maximum(rb - lt, 0.0)
+        inter = wh[:, :, 0] * wh[:, :, 1]
+        area1 = np.maximum(boxes1[:, 2] - boxes1[:, 0], 0.0) * np.maximum(
+            boxes1[:, 3] - boxes1[:, 1], 0.0
+        )
+        area2 = np.maximum(boxes2[:, 2] - boxes2[:, 0], 0.0) * np.maximum(
+            boxes2[:, 3] - boxes2[:, 1], 0.0
+        )
+        union = area1[:, None] + area2[None, :] - inter
+        return inter / np.maximum(union, 1e-6)
 
     def _load_depth(self, dataset_dict, image_shape):
         candidates = []
@@ -87,12 +238,14 @@ class DatasetMapper3D(DatasetMapper):
                 os.path.join(root, "depth", f"{image_id}.npy"),
                 os.path.join(root, "train", "depth", f"{image_id}.npy"),
                 os.path.join(root, "val", "depth", f"{image_id}.npy"),
+                os.path.join(root, "test", "depth", f"{image_id}.npy"),
                 os.path.join(root, "SUNRGBD", "train", "depth", f"{image_id}.npy"),
                 os.path.join(root, "SUNRGBD", "val", "depth", f"{image_id}.npy"),
+                os.path.join(root, "SUNRGBD", "test", "depth", f"{image_id}.npy"),
             ])
 
         file_name = dataset_dict.get("file_name", "")
-        if "/image/" in file_name:
+        if self.depth_allow_sensor_fallback and "/image/" in file_name:
             candidates.extend([
                 file_name.replace("/image/", "/depth/").replace(".jpg", ".png"),
                 file_name.replace("/image/", "/depth_bfx/").replace(".jpg", ".png"),
@@ -120,6 +273,71 @@ class DatasetMapper3D(DatasetMapper):
                 )
             return depth.astype(np.float32)
 
+        return None
+
+    def _load_pseudo_masks(self, dataset_dict, image_shape):
+        image_id = dataset_dict.get("image_id")
+        if image_id is None or not self.pseudo_mask_root:
+            return None
+        image_id = int(image_id)
+        root = self.pseudo_mask_root
+        candidates = [
+            os.path.join(root, "mask", f"{image_id}.npy"),
+            os.path.join(root, "train", "mask", f"{image_id}.npy"),
+            os.path.join(root, "val", "mask", f"{image_id}.npy"),
+            os.path.join(root, "SUNRGBD", "train", "mask", f"{image_id}.npy"),
+            os.path.join(root, "SUNRGBD", "val", "mask", f"{image_id}.npy"),
+        ]
+        for path in candidates:
+            path = os.path.abspath(os.path.expanduser(path))
+            if not os.path.exists(path):
+                continue
+            masks = np.load(path)
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            if masks.ndim == 2:
+                masks = masks[None]
+            if masks.shape[-2:] != tuple(image_shape):
+                masks = np.asarray(
+                    [
+                        cv2.resize(
+                            mask.astype(np.uint8),
+                            (int(image_shape[1]), int(image_shape[0])),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        for mask in masks
+                    ]
+                )
+            return masks
+        return None
+
+    def _load_ground_mask(self, dataset_dict, image_shape):
+        image_id = dataset_dict.get("image_id")
+        if image_id is None or not self.ground_mask_root:
+            return None
+        image_id = int(image_id)
+        root = self.ground_mask_root
+        candidates = [
+            os.path.join(root, "ground_mask", f"{image_id}.npy"),
+            os.path.join(root, "train", "ground_mask", f"{image_id}.npy"),
+            os.path.join(root, "val", "ground_mask", f"{image_id}.npy"),
+            os.path.join(root, "SUNRGBD", "train", "ground_mask", f"{image_id}.npy"),
+            os.path.join(root, "SUNRGBD", "val", "ground_mask", f"{image_id}.npy"),
+        ]
+        for path in candidates:
+            path = os.path.abspath(os.path.expanduser(path))
+            if not os.path.exists(path):
+                continue
+            mask = np.squeeze(np.load(path))
+            if mask.ndim > 2:
+                mask = mask.reshape(-1, mask.shape[-2], mask.shape[-1]).any(axis=0)
+            if mask.shape != tuple(image_shape):
+                mask = cv2.resize(
+                    mask.astype(np.uint8),
+                    (int(image_shape[1]), int(image_shape[0])),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            return mask > 0
         return None
 
     def _read_depth_path(self, path):
@@ -218,8 +436,29 @@ def annotations_to_instances(annos, image_size, unknown_categories):
     if len(annos) > 0:
         weights = [float(anno.get("pseudo_weight", 1.0)) for anno in annos]
         target.gt_pseudo_weight = torch.FloatTensor(weights).clamp(0.05, 1.0)
+        factor_names = ("xy", "z", "dims", "pose", "joint")
+        for factor_name in factor_names:
+            factor_weights = [
+                float(anno.get(f"pseudo_weight_{factor_name}", anno.get("pseudo_weight", 1.0)))
+                for anno in annos
+            ]
+            target.set(
+                f"gt_pseudo_weight_{factor_name}",
+                torch.FloatTensor(factor_weights).clamp(0.05, 1.0),
+            )
+        render_masks = [
+            torch.as_tensor(
+                anno.get("render_mask", np.zeros((28, 28), dtype=np.float32)),
+                dtype=torch.float32,
+            )
+            for anno in annos
+        ]
+        target.gt_render_masks = torch.stack(render_masks, dim=0)
     else:
         target.gt_pseudo_weight = torch.FloatTensor([])
+        for factor_name in ("xy", "z", "dims", "pose", "joint"):
+            target.set(f"gt_pseudo_weight_{factor_name}", torch.FloatTensor([]))
+        target.gt_render_masks = torch.empty((0, 28, 28), dtype=torch.float32)
     
     n = len(target.gt_classes)
 
