@@ -262,6 +262,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         loss_w_geometry_closure=None,
         geometry_apply_to_prediction=None,
         geometry_apply_in_inference=None,
+        geometry_apply_warmup_iters=None,
         geometry_min_dimension=None,
         geometry_max_dimension=None,
         shape_memory_min_confidence=None,
@@ -309,6 +310,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.loss_w_geometry_closure = float(loss_w_geometry_closure or 0.0)
         self.geometry_apply_to_prediction = bool(geometry_apply_to_prediction)
         self.geometry_apply_in_inference = bool(geometry_apply_in_inference)
+        self.geometry_apply_warmup_iters = int(geometry_apply_warmup_iters or 0)
         self.geometry_min_dimension = float(geometry_min_dimension or 0.03)
         self.geometry_max_dimension = float(geometry_max_dimension or 8.0)
         self.shape_memory_min_confidence = float(
@@ -534,6 +536,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'loss_w_geometry_closure': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_GEOMETRY_CLOSURE,
             'geometry_apply_to_prediction': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_APPLY_TO_PREDICTION,
             'geometry_apply_in_inference': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_APPLY_IN_INFERENCE,
+            'geometry_apply_warmup_iters': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_APPLY_WARMUP_ITERS,
             'geometry_min_dimension': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_MIN_DIMENSION,
             'geometry_max_dimension': cfg.MODEL.ROI_CUBE_HEAD.GEOMETRY_MAX_DIMENSION,
             'shape_memory_min_confidence': cfg.MODEL.ROI_CUBE_HEAD.SHAPE_MEMORY_MIN_CONFIDENCE,
@@ -1642,12 +1645,26 @@ class ROIHeads3D_Text(StandardROIHeads):
                     gt_poses=gt_poses,
                     factor_weights=gt_factor_weights,
                 )
-                if self.geometry_apply_to_prediction:
+                geometry_apply_ready = True
+                if self.geometry_apply_warmup_iters > 0:
+                    try:
+                        geometry_apply_ready = (
+                            int(get_event_storage().iter)
+                            >= self.geometry_apply_warmup_iters
+                        )
+                    except Exception:
+                        geometry_apply_ready = False
+                if self.geometry_apply_to_prediction and geometry_apply_ready:
                     cube_x = geometry_cube_x
                     cube_y = geometry_cube_y
                     cube_z = geometry_cube_z
                     cube_dims = geometry_cube_dims
                     cube_pose = geometry_cube_pose
+                get_event_storage().put_scalar(
+                    prefix + "geometry_apply_ready",
+                    float(geometry_apply_ready),
+                    smoothing_hint=False,
+                )
                 if self.loss_w_multi_hypothesis > 0:
                     losses[prefix + 'loss_hypothesis_quality'] = (
                         self.safely_reduce_losses(hypothesis_losses["quality"])

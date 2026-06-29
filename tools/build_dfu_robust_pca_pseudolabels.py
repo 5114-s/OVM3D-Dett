@@ -155,6 +155,12 @@ def parse_args():
     parser.add_argument("--surface_prior_weight", type=float, default=0.15)
     parser.add_argument("--surface_min_point_support", type=float, default=0.25)
     parser.add_argument("--surface_min_support_ratio", type=float, default=0.75)
+    parser.add_argument("--surface_require_improvement", action="store_true", default=True)
+    parser.add_argument("--no_surface_require_improvement", dest="surface_require_improvement", action="store_false")
+    parser.add_argument("--surface_min_loss_gain", type=float, default=0.03)
+    parser.add_argument("--surface_max_bbox_iou_drop", type=float, default=0.03)
+    parser.add_argument("--surface_max_depth_worsen_ratio", type=float, default=1.10)
+    parser.add_argument("--surface_max_support_drop", type=float, default=0.05)
     parser.add_argument("--use_latent_box_closure", action="store_true")
     parser.add_argument("--latent_topk", type=int, default=8)
     parser.add_argument("--latent_temperature", type=float, default=0.25)
@@ -165,6 +171,9 @@ def parse_args():
     parser.add_argument("--reference_min_iou", type=float, default=0.10)
     parser.add_argument("--min_weight", type=float, default=0.35)
     parser.add_argument("--unmatched_weight", type=float, default=0.60)
+    parser.add_argument("--use_bev_nms", action="store_true")
+    parser.add_argument("--bev_nms_iou_threshold", type=float, default=0.45)
+    parser.add_argument("--bev_nms_score_weight", type=float, default=0.50)
     parser.add_argument("--stats_json", default=None)
     return parser.parse_args()
 
@@ -970,6 +979,53 @@ def optimize_box_surface_consistency(
     )
     base_depth_error = abs(base_front - observed_surface) / max(observed_surface, 0.10)
     base_support = point_support_3d(points, center_base, dims_base, R_base)
+    base_prior_error = float(
+        np.mean(
+            np.abs(
+                np.log(
+                    np.maximum(dims_base, 1e-4)
+                    / np.maximum(prior_omni, 1e-4)
+                )
+            )
+        )
+    )
+    base_ground_error = 0.0
+    if ground_equ is not None:
+        base_ground_error = min(
+            float(
+                min(
+                    point_to_plane_distance(ground_equ, *point)
+                    for point in np.asarray(vertices, dtype=np.float64)
+                )
+            ),
+            1.0,
+        )
+    base_loss = (
+        float(args.surface_projection_weight) * (1.0 - base_bbox_iou)
+        + float(args.surface_silhouette_weight) * (1.0 - base_silhouette_iou)
+        + float(args.surface_depth_weight) * min(base_depth_error, 2.0)
+        + float(args.surface_support_weight) * (1.0 - base_support)
+        + float(args.surface_prior_weight) * base_prior_error
+        + 0.10 * base_ground_error
+    )
+    base_candidate = {
+        "loss": float(base_loss),
+        "vertices": np.asarray(vertices, dtype=np.float64),
+        "center": center_base,
+        "dims": dims_base,
+        "R": R_base,
+        "bbox_iou": float(base_bbox_iou),
+        "silhouette_iou": float(base_silhouette_iou),
+        "depth_error": float(base_depth_error),
+        "support": float(base_support),
+        "prior_error": float(base_prior_error),
+        "front_depth": float(base_front),
+        "depth_blend": 0.0,
+        "xy_blend": 0.0,
+        "scale_dims": [1.0, 1.0, 1.0],
+        "yaw_offset": 0.0,
+        "is_base": True,
+    }
     min_support = max(
         float(args.surface_min_point_support),
         base_support * float(args.surface_min_support_ratio),
@@ -980,12 +1036,15 @@ def optimize_box_surface_consistency(
             "surface_opt_base_silhouette_iou": float(base_silhouette_iou),
             "surface_opt_base_depth_rel_error": float(base_depth_error),
             "surface_opt_base_point_support": float(base_support),
+            "surface_opt_base_prior_log_error": float(base_prior_error),
+            "surface_opt_base_loss": float(base_loss),
             "surface_opt_min_point_support": float(min_support),
         }
     )
 
-    best = None
-    valid_candidates = []
+    best = base_candidate
+    valid_candidates = [base_candidate] if args.use_latent_box_closure else []
+    metrics["surface_opt_candidates"] = 1
     for yaw_offset in yaw_values:
         R_candidate = R_base @ rotate_y(yaw_offset)
         for scale_w in scale_values:
@@ -1000,6 +1059,16 @@ def optimize_box_surface_consistency(
                             center_candidate = center_base.copy()
                             center_candidate[:2] += (xy_target - center_candidate[:2]) * xy_blend
                             center_candidate[2] += raw_shift * depth_blend
+                            is_base_candidate = (
+                                abs(float(yaw_offset)) <= 1e-9
+                                and abs(float(scale_w) - 1.0) <= 1e-9
+                                and abs(float(scale_h) - 1.0) <= 1e-9
+                                and abs(float(scale_l) - 1.0) <= 1e-9
+                                and abs(float(depth_blend)) <= 1e-9
+                                and abs(float(xy_blend)) <= 1e-9
+                            )
+                            if is_base_candidate:
+                                continue
                             vertices_candidate = box_vertices_from_pose(
                                 center_candidate,
                                 dims_candidate,
@@ -1067,46 +1136,70 @@ def optimize_box_surface_consistency(
                                 "xy_blend": xy_blend,
                                 "scale_dims": [scale_w, scale_h, scale_l],
                                 "yaw_offset": yaw_offset,
+                                "is_base": False,
                             }
                             if args.use_latent_box_closure:
                                 valid_candidates.append(candidate)
                             if best is None or loss < best["loss"]:
                                 best = candidate
 
-    if best is None:
-        metrics["surface_opt_reason"] = "no_candidate"
-        return fit, metrics
+    chosen = best if best is not None else base_candidate
+    gate_reason = "valid"
+    if (
+        bool(args.surface_require_improvement)
+        and not bool(chosen.get("is_base", False))
+    ):
+        loss_gain = float(base_candidate["loss"] - chosen["loss"])
+        bbox_ok = (
+            float(chosen["bbox_iou"])
+            >= float(base_candidate["bbox_iou"]) - float(args.surface_max_bbox_iou_drop)
+        )
+        depth_ok = (
+            float(chosen["depth_error"])
+            <= float(base_candidate["depth_error"]) * float(args.surface_max_depth_worsen_ratio)
+            + 1e-6
+        )
+        support_ok = (
+            float(chosen["support"])
+            >= float(base_candidate["support"]) - float(args.surface_max_support_drop)
+        )
+        gain_ok = loss_gain >= float(args.surface_min_loss_gain)
+        if not (gain_ok and bbox_ok and depth_ok and support_ok):
+            chosen = base_candidate
+            gate_reason = "kept_base_by_improvement_gate"
 
     metrics.update(
         {
             "surface_opt_applied": bool(
-                abs(float(best["depth_blend"])) > 1e-6
-                or abs(float(best["xy_blend"])) > 1e-6
-                or any(abs(float(v) - 1.0) > 1e-6 for v in best["scale_dims"])
-                or abs(float(best["yaw_offset"])) > 1e-6
+                abs(float(chosen["depth_blend"])) > 1e-6
+                or abs(float(chosen["xy_blend"])) > 1e-6
+                or any(abs(float(v) - 1.0) > 1e-6 for v in chosen["scale_dims"])
+                or abs(float(chosen["yaw_offset"])) > 1e-6
             ),
-            "surface_opt_reason": "valid",
-            "surface_opt_loss": float(best["loss"]),
-            "surface_opt_bbox_iou": float(best["bbox_iou"]),
-            "surface_opt_silhouette_iou": float(best["silhouette_iou"]),
-            "surface_opt_depth_rel_error": float(best["depth_error"]),
-            "surface_opt_point_support": float(best["support"]),
-            "surface_opt_prior_log_error": float(best["prior_error"]),
+            "surface_opt_reason": gate_reason,
+            "surface_opt_best_loss": float(best["loss"]) if best is not None else float(base_loss),
+            "surface_opt_loss": float(chosen["loss"]),
+            "surface_opt_loss_gain": float(base_candidate["loss"] - chosen["loss"]),
+            "surface_opt_bbox_iou": float(chosen["bbox_iou"]),
+            "surface_opt_silhouette_iou": float(chosen["silhouette_iou"]),
+            "surface_opt_depth_rel_error": float(chosen["depth_error"]),
+            "surface_opt_point_support": float(chosen["support"]),
+            "surface_opt_prior_log_error": float(chosen["prior_error"]),
             "surface_opt_observed_depth": observed_surface,
-            "surface_opt_front_depth": float(best["front_depth"]),
-            "surface_opt_depth_blend": float(best["depth_blend"]),
-            "surface_opt_xy_blend": float(best["xy_blend"]),
-            "surface_opt_scale_dims": [float(v) for v in best["scale_dims"]],
-            "surface_opt_yaw_offset": float(best["yaw_offset"]),
+            "surface_opt_front_depth": float(chosen["front_depth"]),
+            "surface_opt_depth_blend": float(chosen["depth_blend"]),
+            "surface_opt_xy_blend": float(chosen["xy_blend"]),
+            "surface_opt_scale_dims": [float(v) for v in chosen["scale_dims"]],
+            "surface_opt_yaw_offset": float(chosen["yaw_offset"]),
         }
     )
     if args.use_latent_box_closure:
         metrics.update(latent_candidate_statistics(valid_candidates, args))
     return (
-        best["vertices"].astype(np.float32),
-        best["center"].astype(np.float32),
-        best["dims"].astype(np.float32),
-        best["R"].astype(np.float32),
+        chosen["vertices"].astype(np.float32),
+        chosen["center"].astype(np.float32),
+        chosen["dims"].astype(np.float32),
+        chosen["R"].astype(np.float32),
     ), metrics
 
 
@@ -1463,6 +1556,84 @@ def reference_match_update(ann: dict, ref_index, args) -> dict:
     return ann
 
 
+def ann_bev_box(ann: dict) -> Optional[np.ndarray]:
+    if not bool(ann.get("valid3D", True)):
+        return None
+    try:
+        vertices = np.asarray(ann["bbox3D_cam"], dtype=np.float64).reshape(8, 3)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(vertices)):
+        return None
+    x_min, z_min = vertices[:, [0, 2]].min(axis=0)
+    x_max, z_max = vertices[:, [0, 2]].max(axis=0)
+    if x_max <= x_min or z_max <= z_min:
+        return None
+    return np.asarray([x_min, z_min, x_max, z_max], dtype=np.float64)
+
+
+def bev_iou_np(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    inter_min = np.maximum(box_a[:2], box_b[:2])
+    inter_max = np.minimum(box_a[2:], box_b[2:])
+    inter_size = np.maximum(inter_max - inter_min, 0.0)
+    inter = float(inter_size[0] * inter_size[1])
+    area_a = float(max(box_a[2] - box_a[0], 0.0) * max(box_a[3] - box_a[1], 0.0))
+    area_b = float(max(box_b[2] - box_b[0], 0.0) * max(box_b[3] - box_b[1], 0.0))
+    denom = area_a + area_b - inter
+    return float(inter / denom) if denom > 1e-12 else 0.0
+
+
+def annotation_nms_quality(ann: dict, args) -> float:
+    score = float(np.clip(float(ann.get("score", 1.0)), 0.0, 1.0))
+    weight = float(
+        np.clip(
+            float(ann.get("pseudo_weight_joint", ann.get("pseudo_weight", 1.0))),
+            0.05,
+            1.0,
+        )
+    )
+    alpha = float(np.clip(args.bev_nms_score_weight, 0.0, 1.0))
+    quality = score * ((1.0 - alpha) + alpha * weight)
+    if "surface_opt_loss" in ann:
+        quality *= float(1.0 / (1.0 + max(float(ann["surface_opt_loss"]), 0.0)))
+    elif "ng_consistency_score" in ann:
+        quality *= float(0.5 + 0.5 * np.clip(float(ann["ng_consistency_score"]), 0.0, 1.0))
+    return float(quality)
+
+
+def apply_bev_nms(annotations: List[dict], args, stats) -> List[dict]:
+    if not bool(args.use_bev_nms):
+        return annotations
+
+    threshold = float(np.clip(args.bev_nms_iou_threshold, 0.0, 1.0))
+    grouped = defaultdict(list)
+    passthrough = []
+    for index, ann in enumerate(annotations):
+        bev_box = ann_bev_box(ann)
+        if bev_box is None:
+            passthrough.append((index, ann))
+            continue
+        key = (int(ann.get("image_id", -1)), int(ann.get("category_id", -1)))
+        grouped[key].append((index, ann, bev_box, annotation_nms_quality(ann, args)))
+
+    keep_indices = {index for index, _ in passthrough}
+    suppressed = 0
+    for group_items in grouped.values():
+        group_items = sorted(group_items, key=lambda item: item[3], reverse=True)
+        kept_boxes = []
+        for index, ann, bev_box, _quality in group_items:
+            if any(bev_iou_np(bev_box, kept) > threshold for kept in kept_boxes):
+                suppressed += 1
+                continue
+            keep_indices.add(index)
+            kept_boxes.append(bev_box)
+
+    stats["bev_nms_enabled"] = 1
+    stats["bev_nms_suppressed"] += int(suppressed)
+    stats["bev_nms_threshold_x1000"] = int(round(threshold * 1000))
+    return [ann for index, ann in enumerate(annotations) if index in keep_indices]
+
+
 def main():
     args = parse_args()
     rng = np.random.default_rng(int(args.seed))
@@ -1692,6 +1863,13 @@ def main():
             annotations.append(ann)
             ann_id += 1
 
+    annotations = apply_bev_nms(annotations, args, stats)
+    weight_values = [
+        float(ann.get("pseudo_weight", 1.0))
+        for ann in annotations
+        if bool(ann.get("valid3D", True))
+    ]
+
     output = {
         "info": copy.deepcopy(source.get("info", {})),
         "images": images,
@@ -1717,6 +1895,9 @@ def main():
     output["info"]["surface_box_optimization"] = bool(args.use_surface_box_optimization)
     output["info"]["source_geometry_anchor"] = bool(args.use_source_geometry_anchor)
     output["info"]["surface_center_mode"] = str(args.surface_center_mode)
+    output["info"]["surface_require_improvement"] = bool(args.surface_require_improvement)
+    output["info"]["bev_nms"] = bool(args.use_bev_nms)
+    output["info"]["bev_nms_iou_threshold"] = float(args.bev_nms_iou_threshold)
     if args.reference_json:
         output["info"]["pseudo_label_reference_json"] = os.path.abspath(args.reference_json)
     if weight_values:
