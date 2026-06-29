@@ -2,17 +2,16 @@
 set -euo pipefail
 
 PL_FOLDER="${PL_FOLDER:-Omni3D_pl-ng-weighted}"
-OUTPUT_DIR="${OUTPUT_DIR:-output/training/SUN_rsh_depthreg}"
+OUTPUT_DIR="${OUTPUT_DIR:-output/training/SUN_rsh_depthreg_copgs}"
 DEPTH_ROOT="${DEPTH_ROOT:-pseudo_label/SUNRGBD}"
 MASK_ROOT="${MASK_ROOT:-pseudo_label/SUNRGBD}"
-DIST_URL="${DIST_URL:-tcp://0.0.0.0:12358}"
+DIST_URL="${DIST_URL:-tcp://0.0.0.0:12362}"
 NUM_GPUS="${NUM_GPUS:-2}"
 
-# Conservative MonoDGP-style RSH route on top of the stable OVM3D-Det path:
-# cached SAM/SAM2 mask -> RSH mask distillation
-# cached UniDepth -> mask-guided depth consistency
-# RSH learns foreground masks but does not adjust 3D pseudo-label weights by default.
-# CubeHead remains the main 3D predictor.
+# OVM3D-Det stable weighted route:
+# ng-weighted pseudo labels + cached UniDepth + true RSH mask matching
+# plus MonoCoP-inspired CoP/GS residual CubeHead adapter.
+# RSH is conservative by default: it learns masks but does not adjust 3D weights.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" python tools/train_net.py \
   --config-file configs/Base_Omni3D_SUN.yaml \
   --dist-url "${DIST_URL}" \
@@ -45,6 +44,13 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" python tools/train_net.py \
   MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP 1.0 \
   MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE front_surface \
   MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE 0.35 \
+  MODEL.ROI_CUBE_HEAD.USE_COP_GS True \
+  MODEL.ROI_CUBE_HEAD.COP_GS_HIDDEN_DIM 256 \
+  MODEL.ROI_CUBE_HEAD.COP_GS_GATE_INIT_BIAS -2.0 \
+  MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_XY 0.20 \
+  MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_Z 0.20 \
+  MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_DIMS 0.20 \
+  MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_POSE 0.20 \
   MODEL.ROI_CUBE_HEAD.USE_GEOMETRY_INTERPRETER False \
   MODEL.EMA_TEACHER.ENABLED False \
   OUTPUT_DIR "${OUTPUT_DIR}" \

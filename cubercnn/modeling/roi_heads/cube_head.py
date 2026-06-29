@@ -6,6 +6,7 @@ from torch import nn
 import torch
 import numpy as np
 import fvcore.nn.weight_init as weight_init
+from detectron2.utils.events import get_event_storage
 
 from pytorch3d.transforms.rotation_conversions import _copysign
 from pytorch3d.transforms import (
@@ -36,6 +37,13 @@ class CubeHead(nn.Module):
         self.residual_scale_z = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_Z
         self.residual_scale_dims = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_DIMS
         self.residual_scale_pose = cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_POSE
+        self.use_cop_gs = cfg.MODEL.ROI_CUBE_HEAD.USE_COP_GS
+        self.cop_gs_hidden_dim = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_HIDDEN_DIM
+        self.cop_gs_gate_init_bias = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_GATE_INIT_BIAS
+        self.cop_gs_scale_xy = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_XY
+        self.cop_gs_scale_z = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_Z
+        self.cop_gs_scale_dims = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_DIMS
+        self.cop_gs_scale_pose = cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_POSE
 
         #-------------------------------------------
         # Feature generator
@@ -165,6 +173,102 @@ class CubeHead(nn.Module):
                 nn.init.constant_(layer.weight, 0.0)
                 nn.init.constant_(layer.bias, 0.0)
 
+        if self.use_cop_gs:
+            hidden_dim = int(self.cop_gs_hidden_dim)
+            if hidden_dim <= 0:
+                hidden_dim = int(self._output_size)
+
+            self.cop_xy_context = self._make_cop_context(self._output_size, hidden_dim)
+            self.cop_z_context = self._make_cop_context(self._output_size + hidden_dim, hidden_dim)
+            self.cop_dims_context = self._make_cop_context(self._output_size + 2 * hidden_dim, hidden_dim)
+            self.cop_pose_context = self._make_cop_context(self._output_size + 3 * hidden_dim, hidden_dim)
+
+            self.cop_xy_residual = nn.Linear(hidden_dim, self.num_classes * 2)
+            self.cop_z_residual = nn.Linear(hidden_dim, self.num_classes * cluster_bins)
+            self.cop_dims_residual = nn.Linear(hidden_dim, self.num_classes * 3)
+            self.cop_pose_residual = nn.Linear(hidden_dim, self.num_classes * pose_dim)
+
+            self.cop_xy_gate = nn.Linear(hidden_dim, self.num_classes * 2)
+            self.cop_z_gate = nn.Linear(hidden_dim, self.num_classes * cluster_bins)
+            self.cop_dims_gate = nn.Linear(hidden_dim, self.num_classes * 3)
+            self.cop_pose_gate = nn.Linear(hidden_dim, self.num_classes * pose_dim)
+
+            for layer in [
+                self.cop_xy_residual,
+                self.cop_z_residual,
+                self.cop_dims_residual,
+                self.cop_pose_residual,
+            ]:
+                nn.init.constant_(layer.weight, 0.0)
+                nn.init.constant_(layer.bias, 0.0)
+
+            for layer in [
+                self.cop_xy_gate,
+                self.cop_z_gate,
+                self.cop_dims_gate,
+                self.cop_pose_gate,
+            ]:
+                nn.init.constant_(layer.weight, 0.0)
+                nn.init.constant_(layer.bias, float(self.cop_gs_gate_init_bias))
+
+    def _make_cop_context(self, input_dim, hidden_dim):
+        layer = nn.Linear(input_dim, hidden_dim)
+        weight_init.c2_xavier_fill(layer)
+        return nn.Sequential(
+            layer,
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def _apply_cop_gs(
+        self,
+        features_xy,
+        features_z,
+        features_dims,
+        features_pose,
+        box_2d_deltas,
+        box_z,
+        box_dims,
+        box_pose,
+    ):
+        ctx_xy = self.cop_xy_context(features_xy)
+        ctx_z = self.cop_z_context(torch.cat([features_z, ctx_xy], dim=1))
+        ctx_dims = self.cop_dims_context(torch.cat([features_dims, ctx_xy, ctx_z], dim=1))
+        ctx_pose = self.cop_pose_context(torch.cat([features_pose, ctx_xy, ctx_z, ctx_dims], dim=1))
+
+        gate_xy = torch.sigmoid(self.cop_xy_gate(ctx_xy))
+        gate_z = torch.sigmoid(self.cop_z_gate(ctx_z))
+        gate_dims = torch.sigmoid(self.cop_dims_gate(ctx_dims))
+        gate_pose = torch.sigmoid(self.cop_pose_gate(ctx_pose))
+
+        box_2d_deltas = (
+            box_2d_deltas
+            + float(self.cop_gs_scale_xy) * gate_xy * self.cop_xy_residual(ctx_xy)
+        )
+        box_z = (
+            box_z
+            + float(self.cop_gs_scale_z) * gate_z * self.cop_z_residual(ctx_z)
+        )
+        box_dims = (
+            box_dims
+            + float(self.cop_gs_scale_dims) * gate_dims * self.cop_dims_residual(ctx_dims)
+        )
+        box_pose = (
+            box_pose
+            + float(self.cop_gs_scale_pose) * gate_pose * self.cop_pose_residual(ctx_pose)
+        )
+
+        if self.training:
+            try:
+                storage = get_event_storage()
+                storage.put_scalar("Cube/cop_gs_gate_xy", gate_xy.mean().item(), smoothing_hint=False)
+                storage.put_scalar("Cube/cop_gs_gate_z", gate_z.mean().item(), smoothing_hint=False)
+                storage.put_scalar("Cube/cop_gs_gate_dims", gate_dims.mean().item(), smoothing_hint=False)
+                storage.put_scalar("Cube/cop_gs_gate_pose", gate_pose.mean().item(), smoothing_hint=False)
+            except AssertionError:
+                pass
+
+        return box_2d_deltas, box_z, box_dims, box_pose
 
     def forward(self, x):
     
@@ -187,6 +291,18 @@ class CubeHead(nn.Module):
                 box_pose = box_pose + self.residual_scale_pose * self.res_bbox_3D_pose(features)
                 box_z = box_z + self.residual_scale_z * self.res_bbox_3D_center_depth(features)
 
+            if self.use_cop_gs:
+                box_2d_deltas, box_z, box_dims, box_pose = self._apply_cop_gs(
+                    features,
+                    features,
+                    features,
+                    features,
+                    box_2d_deltas,
+                    box_z,
+                    box_dims,
+                    box_pose,
+                )
+
             if self.use_conf:
                 box_uncert = self.bbox_3D_uncertainty(features).clip(0.01)
         else:
@@ -206,6 +322,18 @@ class CubeHead(nn.Module):
                 box_dims = box_dims + self.residual_scale_dims * self.res_bbox_3D_dims(features_dims)
                 box_pose = box_pose + self.residual_scale_pose * self.res_bbox_3D_pose(features_pose)
                 box_z = box_z + self.residual_scale_z * self.res_bbox_3D_center_depth(features_z)
+
+            if self.use_cop_gs:
+                box_2d_deltas, box_z, box_dims, box_pose = self._apply_cop_gs(
+                    features_xy,
+                    features_z,
+                    features_dims,
+                    features_pose,
+                    box_2d_deltas,
+                    box_z,
+                    box_dims,
+                    box_pose,
+                )
 
             if self.use_conf:
                 box_uncert = self.bbox_3D_uncertainty(self.feature_generator_conf(x)).clip(0.01)

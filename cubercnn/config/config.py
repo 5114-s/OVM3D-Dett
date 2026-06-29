@@ -156,7 +156,7 @@ def get_cfg_defaults(cfg):
     cfg.INPUT.USE_PSEUDO_MASK = False
     cfg.INPUT.PSEUDO_MASK_ROOT = ""
     cfg.INPUT.PSEUDO_MASK_SIZE = 28
-    cfg.INPUT.PSEUDO_MASK_MATCH_IOU_THRESHOLD = 0.05
+    cfg.INPUT.PSEUDO_MASK_MATCH_IOU_THRESHOLD = 0.20
     cfg.INPUT.PSEUDO_MASK_ALLOW_REUSE = False
     cfg.INPUT.USE_GROUND_MASK = False
     cfg.INPUT.GROUND_MASK_ROOT = ""
@@ -192,7 +192,7 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.RSH_MASK_SIZE = 28
     cfg.MODEL.ROI_CUBE_HEAD.RSH_FEATURE_SCALE = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.RSH_DETACH_MASK_FEATURE = True
-    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION = 0.10
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION = 0.05
     cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE = True
     cfg.MODEL.ROI_CUBE_HEAD.RSH_DEPTH_MASK_THRESHOLD = 0.30
     cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_PSEUDO_WEIGHT = False
@@ -204,6 +204,17 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_Z = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_DIMS = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.RESIDUAL_SCALE_POSE = 1.0
+
+    # MonoCoP-inspired Chain-of-Prediction with a learned selector. This keeps
+    # the original parallel CubeHead prediction as the anchor and adds a small
+    # zero-initialized chain residual: xy -> z -> dims -> pose.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_COP_GS = False
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_HIDDEN_DIM = 256
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_GATE_INIT_BIAS = -2.0
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_XY = 0.20
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_Z = 0.20
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_DIMS = 0.20
+    cfg.MODEL.ROI_CUBE_HEAD.COP_GS_SCALE_POSE = 0.20
 
     # Multi-modal latent-box interpreter.
     cfg.MODEL.ROI_CUBE_HEAD.USE_GEOMETRY_INTERPRETER = False
