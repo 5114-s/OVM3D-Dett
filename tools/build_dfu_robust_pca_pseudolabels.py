@@ -112,6 +112,16 @@ def parse_args():
     parser.add_argument("--depth_edge_dilate", type=int, default=1)
     parser.add_argument("--depth_edge_min_keep_ratio", type=float, default=0.25)
 
+    parser.add_argument("--use_depth_aware_mask_selector", action="store_true")
+    parser.add_argument("--mask_selector_depth_percentile_low", type=float, default=5.0)
+    parser.add_argument("--mask_selector_depth_percentile_high", type=float, default=95.0)
+    parser.add_argument("--mask_selector_mad_scale", type=float, default=2.5)
+    parser.add_argument("--mask_selector_min_depth_window", type=float, default=0.05)
+    parser.add_argument("--mask_selector_min_keep_ratio", type=float, default=0.18)
+    parser.add_argument("--mask_selector_min_score_gain", type=float, default=0.03)
+    parser.add_argument("--mask_selector_ring_dilate", type=int, default=5)
+    parser.add_argument("--mask_selector_store_candidates", action="store_true")
+
     parser.add_argument("--use_frustum_dbscan", action="store_true")
     parser.add_argument("--dbscan_eps_ratio", type=float, default=0.018)
     parser.add_argument("--dbscan_eps_min", type=float, default=0.035)
@@ -161,6 +171,8 @@ def parse_args():
     parser.add_argument("--surface_max_bbox_iou_drop", type=float, default=0.03)
     parser.add_argument("--surface_max_depth_worsen_ratio", type=float, default=1.10)
     parser.add_argument("--surface_max_support_drop", type=float, default=0.05)
+    parser.add_argument("--surface_include_right_angle_yaws", action="store_true")
+    parser.add_argument("--surface_enable_dims_swap", action="store_true")
     parser.add_argument("--use_latent_box_closure", action="store_true")
     parser.add_argument("--latent_topk", type=int, default=8)
     parser.add_argument("--latent_temperature", type=float, default=0.25)
@@ -348,6 +360,247 @@ def remove_depth_edges(
         }
     )
     return cleaned.astype(np.float32), metrics
+
+
+def largest_connected_component(mask_bool: np.ndarray) -> np.ndarray:
+    mask_u8 = np.asarray(mask_bool, dtype=np.uint8)
+    if int(mask_u8.sum()) == 0:
+        return mask_u8.astype(bool)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, 8)
+    if num_labels <= 1:
+        return mask_u8.astype(bool)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(np.argmax(areas)) + 1
+    return labels == largest
+
+
+def bbox_area_pixels(bbox: Sequence[float], h: int, w: int) -> float:
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    x1 = float(np.clip(x1, 0, max(w - 1, 0)))
+    x2 = float(np.clip(x2, 0, max(w - 1, 0)))
+    y1 = float(np.clip(y1, 0, max(h - 1, 0)))
+    y2 = float(np.clip(y2, 0, max(h - 1, 0)))
+    return max(1.0, (x2 - x1 + 1.0) * (y2 - y1 + 1.0))
+
+
+def mask_depth_selector_metrics(
+    depth: np.ndarray,
+    mask_bool: np.ndarray,
+    raw_mask_bool: np.ndarray,
+    bbox: Sequence[float],
+    args,
+) -> Dict[str, object]:
+    mask_bool = np.asarray(mask_bool).squeeze() > 0
+    raw_mask_bool = np.asarray(raw_mask_bool).squeeze() > 0
+    depth_np = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(depth_np) & (depth_np > 0.05)
+    selected = mask_bool & valid
+    pixel_count = int(mask_bool.sum())
+    valid_count = int(selected.sum())
+    raw_pixels = max(int(raw_mask_bool.sum()), 1)
+    metrics: Dict[str, object] = {
+        "pixels": pixel_count,
+        "valid_pixels": valid_count,
+        "keep_ratio": float(pixel_count / raw_pixels),
+        "score": -1.0,
+        "valid_ratio": 0.0,
+        "compactness": 0.0,
+        "inlier_ratio": 0.0,
+        "area_score": 0.0,
+        "separation_score": 0.5,
+    }
+    if pixel_count <= 0 or valid_count <= 0:
+        return metrics
+
+    values = depth_np[selected].astype(np.float64)
+    median = float(np.median(values))
+    q25, q75 = np.percentile(values, [25.0, 75.0])
+    iqr = float(max(q75 - q25, 0.0))
+    mad = float(np.median(np.abs(values - median)))
+    sigma = 1.4826 * mad
+    window = max(float(args.mask_selector_min_depth_window), float(args.mask_selector_mad_scale) * sigma)
+    inlier_ratio = float(np.mean(np.abs(values - median) <= window))
+    valid_ratio = float(valid_count / max(pixel_count, 1))
+    compactness = float(math.exp(-iqr / max(0.12 * median, 0.05)))
+    keep_ratio = float(pixel_count / raw_pixels)
+    h, w = depth_np.shape[:2]
+    bbox_area = bbox_area_pixels(bbox, h, w)
+    fill_ratio = float(pixel_count / max(bbox_area, 1.0))
+    # Prefer masks that are neither tiny fragments nor entire loose 2D boxes.
+    area_score = float(
+        np.clip(keep_ratio / max(float(args.mask_selector_min_keep_ratio), 1e-4), 0.0, 1.0)
+        * np.clip(fill_ratio / 0.65, 0.0, 1.0)
+    )
+
+    separation_score = 0.5
+    dilate = max(1, int(args.mask_selector_ring_dilate))
+    kernel = np.ones((2 * dilate + 1, 2 * dilate + 1), dtype=np.uint8)
+    ring = cv2.dilate(mask_bool.astype(np.uint8), kernel, iterations=1).astype(bool) & ~mask_bool
+    ring_values = depth_np[ring & valid]
+    if ring_values.size >= 8:
+        bg_median = float(np.median(ring_values))
+        # Foreground objects should usually be no farther than the local ring.
+        separation_score = float(
+            np.clip(0.5 + (bg_median - median) / max(0.35 * median, 0.10), 0.0, 1.0)
+        )
+
+    score = (
+        0.28 * valid_ratio
+        + 0.27 * compactness
+        + 0.22 * inlier_ratio
+        + 0.13 * area_score
+        + 0.10 * separation_score
+    )
+    metrics.update(
+        {
+            "score": float(score),
+            "valid_ratio": valid_ratio,
+            "compactness": compactness,
+            "inlier_ratio": inlier_ratio,
+            "area_score": area_score,
+            "separation_score": separation_score,
+            "depth_median": median,
+            "depth_iqr": iqr,
+            "depth_mad": mad,
+            "depth_window": float(window),
+            "fill_ratio": fill_ratio,
+        }
+    )
+    return metrics
+
+
+def build_depth_core_mask(
+    depth: np.ndarray,
+    mask_bool: np.ndarray,
+    args,
+) -> np.ndarray:
+    mask_bool = np.asarray(mask_bool).squeeze() > 0
+    depth_np = np.asarray(depth, dtype=np.float32)
+    valid = mask_bool & np.isfinite(depth_np) & (depth_np > 0.05)
+    if int(valid.sum()) == 0:
+        return np.zeros_like(mask_bool, dtype=bool)
+    values = depth_np[valid].astype(np.float64)
+    p_low, p_high = clamp_percentile_pair(
+        args.mask_selector_depth_percentile_low,
+        args.mask_selector_depth_percentile_high,
+    )
+    lo, hi = np.percentile(values, [p_low, p_high])
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    sigma = 1.4826 * mad
+    window = max(float(args.mask_selector_min_depth_window), float(args.mask_selector_mad_scale) * sigma)
+    lo = max(float(lo), median - window)
+    hi = min(float(hi), median + window)
+    core = valid & (depth_np >= lo) & (depth_np <= hi)
+    if int(core.sum()) == 0:
+        return core
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    core = cv2.morphologyEx(core.astype(np.uint8), cv2.MORPH_OPEN, kernel, iterations=1).astype(bool)
+    return core
+
+
+def select_depth_aware_mask(
+    depth: np.ndarray,
+    eroded_mask: np.ndarray,
+    raw_mask: np.ndarray,
+    bbox: Sequence[float],
+    args,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    raw_bool = np.asarray(raw_mask).squeeze() > 0
+    eroded_bool = np.asarray(eroded_mask).squeeze() > 0
+    metrics: Dict[str, object] = {
+        "mask_selector_enabled": bool(args.use_depth_aware_mask_selector),
+        "mask_selector_selected": "eroded",
+        "mask_selector_replaced": False,
+    }
+    if not args.use_depth_aware_mask_selector:
+        return eroded_bool.astype(np.float32), metrics
+
+    candidates: List[Tuple[str, np.ndarray]] = []
+    if int(eroded_bool.sum()) > 0:
+        candidates.append(("eroded", eroded_bool))
+        candidates.append(("eroded_lcc", largest_connected_component(eroded_bool)))
+    if int(raw_bool.sum()) > 0:
+        candidates.append(("raw", raw_bool))
+        core = build_depth_core_mask(depth, raw_bool, args)
+        if int(core.sum()) > 0:
+            candidates.append(("depth_core", core))
+            candidates.append(("depth_core_lcc", largest_connected_component(core)))
+
+    if not candidates:
+        metrics["mask_selector_reason"] = "no_candidates"
+        return eroded_bool.astype(np.float32), metrics
+
+    evaluated = []
+    raw_pixels = max(int(raw_bool.sum()), 1)
+    min_pixels = max(int(args.min_mask_pixels), int(round(raw_pixels * float(args.mask_selector_min_keep_ratio))))
+    for name, candidate in candidates:
+        candidate_bool = np.asarray(candidate).squeeze() > 0
+        item = mask_depth_selector_metrics(depth, candidate_bool, raw_bool, bbox, args)
+        item["name"] = name
+        if int(item["pixels"]) < min_pixels:
+            item["eligible"] = False
+            item["reject_reason"] = "too_small"
+        elif int(item["valid_pixels"]) < int(args.min_points):
+            item["eligible"] = False
+            item["reject_reason"] = "too_few_depth_pixels"
+        else:
+            item["eligible"] = True
+            item["reject_reason"] = "ok"
+        evaluated.append((name, candidate_bool, item))
+
+    default_item = next((item for name, _, item in evaluated if name == "eroded"), evaluated[0][2])
+    eligible = [entry for entry in evaluated if bool(entry[2].get("eligible", False))]
+    if not eligible:
+        metrics.update(
+            {
+                "mask_selector_reason": "no_eligible_candidate",
+                "mask_selector_default_score": float(default_item.get("score", -1.0)),
+                "mask_selector_candidates": len(evaluated),
+            }
+        )
+        return eroded_bool.astype(np.float32), metrics
+
+    best_name, best_mask, best_item = max(eligible, key=lambda entry: float(entry[2].get("score", -1.0)))
+    default_score = float(default_item.get("score", -1.0))
+    best_score = float(best_item.get("score", -1.0))
+    replacement_ok = (
+        best_name == "eroded"
+        or best_score >= default_score + float(args.mask_selector_min_score_gain)
+        or int(eroded_bool.sum()) < int(args.min_mask_pixels)
+    )
+    selected_name = best_name if replacement_ok else "eroded"
+    selected_mask = best_mask if replacement_ok else eroded_bool
+    selected_item = best_item if replacement_ok else default_item
+    metrics.update(
+        {
+            "mask_selector_selected": selected_name,
+            "mask_selector_replaced": bool(selected_name != "eroded"),
+            "mask_selector_reason": "selected" if replacement_ok else "kept_eroded_by_gain_gate",
+            "mask_selector_candidates": len(evaluated),
+            "mask_selector_default_score": default_score,
+            "mask_selector_best_score": best_score,
+            "mask_selector_score": float(selected_item.get("score", -1.0)),
+            "mask_selector_pixels": int(selected_item.get("pixels", 0)),
+            "mask_selector_valid_pixels": int(selected_item.get("valid_pixels", 0)),
+            "mask_selector_keep_ratio": float(selected_item.get("keep_ratio", 0.0)),
+            "mask_selector_depth_iqr": float(selected_item.get("depth_iqr", 0.0)),
+            "mask_selector_inlier_ratio": float(selected_item.get("inlier_ratio", 0.0)),
+        }
+    )
+    if args.mask_selector_store_candidates:
+        metrics["mask_selector_candidate_scores"] = [
+            {
+                "name": str(item["name"]),
+                "score": float(item.get("score", -1.0)),
+                "pixels": int(item.get("pixels", 0)),
+                "valid_pixels": int(item.get("valid_pixels", 0)),
+                "eligible": bool(item.get("eligible", False)),
+                "reject_reason": str(item.get("reject_reason", "")),
+            }
+            for _, _, item in evaluated
+        ]
+    return selected_mask.astype(np.float32), metrics
 
 
 def estimate_depth_normal(
@@ -959,7 +1212,24 @@ def optimize_box_surface_consistency(
         set([max(0.5, 1.0 - height_delta), 1.0, 1.0 + height_delta])
     )
     yaw_delta = math.radians(max(0.0, float(args.surface_yaw_delta_deg)))
-    yaw_values = sorted(set([-yaw_delta, 0.0, yaw_delta]))
+    local_yaw_offsets = [-yaw_delta, 0.0, yaw_delta]
+    yaw_anchors = [0.0]
+    if bool(args.surface_include_right_angle_yaws):
+        yaw_anchors.extend([-0.5 * math.pi, 0.5 * math.pi])
+    yaw_values = sorted(
+        set(
+            float(anchor + local)
+            for anchor in yaw_anchors
+            for local in local_yaw_offsets
+        )
+    )
+    dims_variants = [("base", dims_base.copy())]
+    if bool(args.surface_enable_dims_swap):
+        # Omni3D dimensions are [local-z width, local-y height, local-x length].
+        # Swapping local x/z covers the common 90-degree yaw / length-width ambiguity.
+        swapped = dims_base[[2, 1, 0]].copy()
+        if not np.allclose(swapped, dims_base, rtol=1e-4, atol=1e-4):
+            dims_variants.append(("width_length_swap", swapped))
     if args.surface_center_mode == "locked":
         depth_blends = [0.0]
         xy_blends = [0.0]
@@ -1023,6 +1293,7 @@ def optimize_box_surface_consistency(
         "depth_blend": 0.0,
         "xy_blend": 0.0,
         "scale_dims": [1.0, 1.0, 1.0],
+        "dims_variant": "base",
         "yaw_offset": 0.0,
         "is_base": True,
     }
@@ -1045,103 +1316,108 @@ def optimize_box_surface_consistency(
     best = base_candidate
     valid_candidates = [base_candidate] if args.use_latent_box_closure else []
     metrics["surface_opt_candidates"] = 1
-    for yaw_offset in yaw_values:
-        R_candidate = R_base @ rotate_y(yaw_offset)
-        for scale_w in scale_values:
-            for scale_h in height_scale_values:
-                for scale_l in scale_values:
-                    dims_candidate = dims_base * np.asarray(
-                        [scale_w, scale_h, scale_l],
-                        dtype=np.float64,
-                    )
-                    for depth_blend in depth_blends:
-                        for xy_blend in xy_blends:
-                            center_candidate = center_base.copy()
-                            center_candidate[:2] += (xy_target - center_candidate[:2]) * xy_blend
-                            center_candidate[2] += raw_shift * depth_blend
-                            is_base_candidate = (
-                                abs(float(yaw_offset)) <= 1e-9
-                                and abs(float(scale_w) - 1.0) <= 1e-9
-                                and abs(float(scale_h) - 1.0) <= 1e-9
-                                and abs(float(scale_l) - 1.0) <= 1e-9
-                                and abs(float(depth_blend)) <= 1e-9
-                                and abs(float(xy_blend)) <= 1e-9
-                            )
-                            if is_base_candidate:
-                                continue
-                            vertices_candidate = box_vertices_from_pose(
-                                center_candidate,
-                                dims_candidate,
-                                R_candidate,
-                            )
-                            if np.any(vertices_candidate[:, 2] <= 1e-4):
-                                continue
+    metrics["surface_opt_yaw_family_count"] = int(len(yaw_values))
+    metrics["surface_opt_dims_variant_count"] = int(len(dims_variants))
+    for dims_variant_name, dims_seed in dims_variants:
+        for yaw_offset in yaw_values:
+            R_candidate = R_base @ rotate_y(yaw_offset)
+            for scale_w in scale_values:
+                for scale_h in height_scale_values:
+                    for scale_l in scale_values:
+                        dims_candidate = dims_seed * np.asarray(
+                            [scale_w, scale_h, scale_l],
+                            dtype=np.float64,
+                        )
+                        for depth_blend in depth_blends:
+                            for xy_blend in xy_blends:
+                                center_candidate = center_base.copy()
+                                center_candidate[:2] += (xy_target - center_candidate[:2]) * xy_blend
+                                center_candidate[2] += raw_shift * depth_blend
+                                is_base_candidate = (
+                                    dims_variant_name == "base"
+                                    and abs(float(yaw_offset)) <= 1e-9
+                                    and abs(float(scale_w) - 1.0) <= 1e-9
+                                    and abs(float(scale_h) - 1.0) <= 1e-9
+                                    and abs(float(scale_l) - 1.0) <= 1e-9
+                                    and abs(float(depth_blend)) <= 1e-9
+                                    and abs(float(xy_blend)) <= 1e-9
+                                )
+                                if is_base_candidate:
+                                    continue
+                                vertices_candidate = box_vertices_from_pose(
+                                    center_candidate,
+                                    dims_candidate,
+                                    R_candidate,
+                                )
+                                if np.any(vertices_candidate[:, 2] <= 1e-4):
+                                    continue
 
-                            bbox_score, silhouette_score = projected_box_metrics(
-                                vertices_candidate,
-                                K,
-                                target_bbox,
-                                target_mask,
-                            )
-                            front_depth = float(np.min(vertices_candidate[:, 2]))
-                            depth_error = abs(front_depth - observed_surface) / max(observed_surface, 0.10)
-                            support = point_support_3d(
-                                points,
-                                center_candidate,
-                                dims_candidate,
-                                R_candidate,
-                            )
-                            if support < min_support:
-                                continue
-                            prior_error = float(
-                                np.mean(
-                                    np.abs(
-                                        np.log(
-                                            np.maximum(dims_candidate, 1e-4)
-                                            / np.maximum(prior_omni, 1e-4)
+                                bbox_score, silhouette_score = projected_box_metrics(
+                                    vertices_candidate,
+                                    K,
+                                    target_bbox,
+                                    target_mask,
+                                )
+                                front_depth = float(np.min(vertices_candidate[:, 2]))
+                                depth_error = abs(front_depth - observed_surface) / max(observed_surface, 0.10)
+                                support = point_support_3d(
+                                    points,
+                                    center_candidate,
+                                    dims_candidate,
+                                    R_candidate,
+                                )
+                                if support < min_support:
+                                    continue
+                                prior_error = float(
+                                    np.mean(
+                                        np.abs(
+                                            np.log(
+                                                np.maximum(dims_candidate, 1e-4)
+                                                / np.maximum(prior_omni, 1e-4)
+                                            )
                                         )
                                     )
                                 )
-                            )
-                            ground_error = 0.0
-                            if ground_equ is not None:
-                                bottom_dist = min(
-                                    point_to_plane_distance(ground_equ, *point)
-                                    for point in vertices_candidate
-                                )
-                                ground_error = min(float(bottom_dist), 1.0)
+                                ground_error = 0.0
+                                if ground_equ is not None:
+                                    bottom_dist = min(
+                                        point_to_plane_distance(ground_equ, *point)
+                                        for point in vertices_candidate
+                                    )
+                                    ground_error = min(float(bottom_dist), 1.0)
 
-                            loss = (
-                                float(args.surface_projection_weight) * (1.0 - bbox_score)
-                                + float(args.surface_silhouette_weight) * (1.0 - silhouette_score)
-                                + float(args.surface_depth_weight) * min(depth_error, 2.0)
-                                + float(args.surface_support_weight) * (1.0 - support)
-                                + float(args.surface_prior_weight) * prior_error
-                                + 0.10 * ground_error
-                            )
-                            metrics["surface_opt_candidates"] += 1
-                            candidate = {
-                                "loss": loss,
-                                "vertices": vertices_candidate,
-                                "center": center_candidate,
-                                "dims": dims_candidate,
-                                "R": R_candidate,
-                                "bbox_iou": bbox_score,
-                                "silhouette_iou": silhouette_score,
-                                "depth_error": depth_error,
-                                "support": support,
-                                "prior_error": prior_error,
-                                "front_depth": front_depth,
-                                "depth_blend": depth_blend,
-                                "xy_blend": xy_blend,
-                                "scale_dims": [scale_w, scale_h, scale_l],
-                                "yaw_offset": yaw_offset,
-                                "is_base": False,
-                            }
-                            if args.use_latent_box_closure:
-                                valid_candidates.append(candidate)
-                            if best is None or loss < best["loss"]:
-                                best = candidate
+                                loss = (
+                                    float(args.surface_projection_weight) * (1.0 - bbox_score)
+                                    + float(args.surface_silhouette_weight) * (1.0 - silhouette_score)
+                                    + float(args.surface_depth_weight) * min(depth_error, 2.0)
+                                    + float(args.surface_support_weight) * (1.0 - support)
+                                    + float(args.surface_prior_weight) * prior_error
+                                    + 0.10 * ground_error
+                                )
+                                metrics["surface_opt_candidates"] += 1
+                                candidate = {
+                                    "loss": loss,
+                                    "vertices": vertices_candidate,
+                                    "center": center_candidate,
+                                    "dims": dims_candidate,
+                                    "R": R_candidate,
+                                    "bbox_iou": bbox_score,
+                                    "silhouette_iou": silhouette_score,
+                                    "depth_error": depth_error,
+                                    "support": support,
+                                    "prior_error": prior_error,
+                                    "front_depth": front_depth,
+                                    "depth_blend": depth_blend,
+                                    "xy_blend": xy_blend,
+                                    "scale_dims": [scale_w, scale_h, scale_l],
+                                    "dims_variant": dims_variant_name,
+                                    "yaw_offset": yaw_offset,
+                                    "is_base": False,
+                                }
+                                if args.use_latent_box_closure:
+                                    valid_candidates.append(candidate)
+                                if best is None or loss < best["loss"]:
+                                    best = candidate
 
     chosen = best if best is not None else base_candidate
     gate_reason = "valid"
@@ -1174,6 +1450,7 @@ def optimize_box_surface_consistency(
                 abs(float(chosen["depth_blend"])) > 1e-6
                 or abs(float(chosen["xy_blend"])) > 1e-6
                 or any(abs(float(v) - 1.0) > 1e-6 for v in chosen["scale_dims"])
+                or str(chosen.get("dims_variant", "base")) != "base"
                 or abs(float(chosen["yaw_offset"])) > 1e-6
             ),
             "surface_opt_reason": gate_reason,
@@ -1190,6 +1467,7 @@ def optimize_box_surface_consistency(
             "surface_opt_depth_blend": float(chosen["depth_blend"]),
             "surface_opt_xy_blend": float(chosen["xy_blend"]),
             "surface_opt_scale_dims": [float(v) for v in chosen["scale_dims"]],
+            "surface_opt_dims_variant": str(chosen.get("dims_variant", "base")),
             "surface_opt_yaw_offset": float(chosen["yaw_offset"]),
         }
     )
@@ -1717,14 +1995,31 @@ def main():
             extra["source_anchor_match_iou"] = float(source_anchor_iou)
             extra["source_anchor_id"] = int(source_anchor.get("id", -1)) if source_anchor is not None else -1
 
-            cur_mask = mask[j]
-            mask_source = "eroded"
+            if bool(args.use_depth_aware_mask_selector):
+                cur_mask, selector_metrics = select_depth_aware_mask(
+                    depth,
+                    mask[j],
+                    raw_mask[j],
+                    bbox,
+                    args,
+                )
+                extra.update(selector_metrics)
+                mask_source = "selector_" + str(selector_metrics.get("mask_selector_selected", "unknown"))
+            else:
+                cur_mask = mask[j]
+                mask_source = "eroded"
+                if (
+                    np.asarray(cur_mask).sum() < int(args.min_mask_pixels)
+                    and np.asarray(raw_mask[j]).sum() >= int(args.min_mask_pixels)
+                ):
+                    cur_mask = raw_mask[j]
+                    mask_source = "raw_fallback"
             if (
                 np.asarray(cur_mask).sum() < int(args.min_mask_pixels)
                 and np.asarray(raw_mask[j]).sum() >= int(args.min_mask_pixels)
             ):
                 cur_mask = raw_mask[j]
-                mask_source = "raw_fallback"
+                mask_source = "raw_fallback_after_selector"
             extra["dfu_mask_source"] = mask_source
             if np.asarray(cur_mask).sum() < int(args.min_mask_pixels):
                 stats["invalid_small_mask"] += 1
@@ -1881,6 +2176,7 @@ def main():
         "imov3d_depth_edge_dbscan_normal_surface_optimization"
         if (
             args.use_depth_edge_filter
+            or args.use_depth_aware_mask_selector
             or args.use_frustum_dbscan
             or args.use_normal_ground_fusion
             or args.use_surface_box_optimization
@@ -1889,10 +2185,13 @@ def main():
     )
     output["info"]["pseudo_label_source_json"] = os.path.abspath(args.source_json)
     output["info"]["pseudo_label_cache_root"] = os.path.abspath(input_folder)
+    output["info"]["depth_aware_mask_selector"] = bool(args.use_depth_aware_mask_selector)
     output["info"]["imov3d_depth_edge_filter"] = bool(args.use_depth_edge_filter)
     output["info"]["imov3d_frustum_dbscan"] = bool(args.use_frustum_dbscan)
     output["info"]["imov3d_normal_ground_fusion"] = bool(args.use_normal_ground_fusion)
     output["info"]["surface_box_optimization"] = bool(args.use_surface_box_optimization)
+    output["info"]["surface_include_right_angle_yaws"] = bool(args.surface_include_right_angle_yaws)
+    output["info"]["surface_enable_dims_swap"] = bool(args.surface_enable_dims_swap)
     output["info"]["source_geometry_anchor"] = bool(args.use_source_geometry_anchor)
     output["info"]["surface_center_mode"] = str(args.surface_center_mode)
     output["info"]["surface_require_improvement"] = bool(args.surface_require_improvement)

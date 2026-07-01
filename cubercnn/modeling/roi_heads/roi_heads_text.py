@@ -189,6 +189,103 @@ class RegionSegmentationHead(nn.Module):
         return enhanced_features, mask_logits, torch.sigmoid(mask_logits)
 
 
+class ZeroEmbeddingGeometryAdapter(nn.Module):
+    """
+    DetAny3D-style zero-init geometry adapter.
+
+    It injects metric point-map / camera ray / mask cues into the pooled 3D RoI
+    feature. The output projection is zero-initialized, so the first forward pass
+    is exactly equivalent to the original CubeHead input.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        hidden_dim=128,
+        adapter_scale=1.0,
+        gate_init_bias=-2.0,
+        use_depth=True,
+        use_ray=True,
+        use_mask=True,
+        detach_geometry=True,
+    ):
+        super().__init__()
+        self.adapter_scale = float(adapter_scale)
+        self.use_depth = bool(use_depth)
+        self.use_ray = bool(use_ray)
+        self.use_mask = bool(use_mask)
+        self.detach_geometry = bool(detach_geometry)
+        geometry_channels = 0
+        if self.use_depth:
+            geometry_channels += 3
+        if self.use_ray:
+            geometry_channels += 3
+        if self.use_mask:
+            geometry_channels += 1
+        geometry_channels = max(1, geometry_channels)
+        hidden_dim = max(8, int(hidden_dim))
+
+        num_groups = min(8, hidden_dim)
+        while hidden_dim % num_groups != 0 and num_groups > 1:
+            num_groups -= 1
+
+        self.geometry_encoder = nn.Sequential(
+            nn.Conv2d(geometry_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.GELU(),
+        )
+        self.delta_projection = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
+        self.gate_projection = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
+        nn.init.constant_(self.delta_projection.weight, 0.0)
+        nn.init.constant_(self.delta_projection.bias, 0.0)
+        nn.init.constant_(self.gate_projection.weight, 0.0)
+        nn.init.constant_(self.gate_projection.bias, float(gate_init_bias))
+
+    @staticmethod
+    def _normalize_point_roi(point_roi: torch.Tensor) -> torch.Tensor:
+        z = point_roi[:, 2:3]
+        valid = torch.isfinite(point_roi).all(dim=1, keepdim=True) & (z > 0.05)
+        z_safe = z.clamp(min=0.05)
+        x_over_z = (point_roi[:, 0:1] / z_safe).clamp(-3.0, 3.0)
+        y_over_z = (point_roi[:, 1:2] / z_safe).clamp(-3.0, 3.0)
+        log_z = torch.log(z_safe).clamp(-4.0, 4.0)
+        normalized = torch.cat((x_over_z, y_over_z, log_z), dim=1)
+        return torch.where(valid, normalized, torch.zeros_like(normalized))
+
+    def forward(self, roi_features, point_roi=None, ray_roi=None, mask_roi=None):
+        if roi_features.numel() == 0:
+            return roi_features, None
+        geometry_parts = []
+        if self.use_depth and point_roi is not None:
+            geometry_parts.append(self._normalize_point_roi(point_roi.float()))
+        if self.use_ray and ray_roi is not None:
+            geometry_parts.append(ray_roi.float().clamp(-1.0, 1.0))
+        if self.use_mask and mask_roi is not None:
+            if mask_roi.dim() == 3:
+                mask_roi = mask_roi[:, None]
+            if mask_roi.shape[-2:] != roi_features.shape[-2:]:
+                mask_roi = F.interpolate(
+                    mask_roi.float(),
+                    size=roi_features.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            geometry_parts.append(mask_roi.float().clamp(0.0, 1.0))
+        if not geometry_parts:
+            return roi_features, None
+        geometry = torch.cat(geometry_parts, dim=1)
+        if self.detach_geometry:
+            geometry = geometry.detach()
+        encoded = self.geometry_encoder(geometry)
+        gate = torch.sigmoid(self.gate_projection(encoded))
+        delta = self.delta_projection(encoded)
+        enhanced = roi_features + self.adapter_scale * gate * delta
+        return enhanced, gate
+
+
 def build_roi_heads(cfg, input_shape, priors=None):
     """
     Build ROIHeads defined by `cfg.MODEL.ROI_HEADS.NAME`.
@@ -211,6 +308,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         dino_encoder: nn.Module = None,
         soft_renderer: nn.Module = None,
         region_segmentation_head: nn.Module = None,
+        zem_adapter: nn.Module = None,
         loss_w_3d: float,
         loss_w_xy: float,
         loss_w_z: float,
@@ -246,6 +344,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         rsh_use_depth_guidance=None,
         rsh_depth_mask_threshold=None,
         rsh_use_pseudo_weight=None,
+        use_zem_adapter=None,
         use_geometry_interpreter=None,
         loss_w_multi_hypothesis=None,
         use_differentiable_renderer=None,
@@ -289,6 +388,8 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.rsh_use_depth_guidance = bool(rsh_use_depth_guidance)
         self.rsh_depth_mask_threshold = float(rsh_depth_mask_threshold or 0.30)
         self.rsh_use_pseudo_weight = bool(rsh_use_pseudo_weight)
+        self.use_zem_adapter = bool(use_zem_adapter)
+        self.zem_adapter = zem_adapter
         self.use_geometry_interpreter = bool(use_geometry_interpreter)
         self.geometry_interpreter = geometry_interpreter
         self.dino_encoder = dino_encoder
@@ -439,6 +540,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         dino_encoder = None
         soft_renderer = None
         region_segmentation_head = None
+        zem_adapter = None
         if cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD:
             region_segmentation_head = RegionSegmentationHead(
                 in_channels=in_channels,
@@ -446,6 +548,17 @@ class ROIHeads3D_Text(StandardROIHeads):
                 mask_size=cfg.MODEL.ROI_CUBE_HEAD.RSH_MASK_SIZE,
                 feature_scale=cfg.MODEL.ROI_CUBE_HEAD.RSH_FEATURE_SCALE,
                 detach_mask_feature=cfg.MODEL.ROI_CUBE_HEAD.RSH_DETACH_MASK_FEATURE,
+            )
+        if cfg.MODEL.ROI_CUBE_HEAD.USE_ZEM_ADAPTER:
+            zem_adapter = ZeroEmbeddingGeometryAdapter(
+                in_channels=in_channels,
+                hidden_dim=cfg.MODEL.ROI_CUBE_HEAD.ZEM_HIDDEN_DIM,
+                adapter_scale=cfg.MODEL.ROI_CUBE_HEAD.ZEM_ADAPTER_SCALE,
+                gate_init_bias=cfg.MODEL.ROI_CUBE_HEAD.ZEM_GATE_INIT_BIAS,
+                use_depth=cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_DEPTH,
+                use_ray=cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_RAY,
+                use_mask=cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_MASK,
+                detach_geometry=cfg.MODEL.ROI_CUBE_HEAD.ZEM_DETACH_GEOMETRY,
             )
         if use_geometry_interpreter:
             dino_encoder = FrozenDINOv2MultiScale(
@@ -485,6 +598,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'dino_encoder': dino_encoder,
             'soft_renderer': soft_renderer,
             'region_segmentation_head': region_segmentation_head,
+            'zem_adapter': zem_adapter,
             'use_confidence': cfg.MODEL.ROI_CUBE_HEAD.USE_CONFIDENCE,
             'inverse_z_weight': cfg.MODEL.ROI_CUBE_HEAD.INVERSE_Z_WEIGHT,
             'loss_w_3d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D,
@@ -520,6 +634,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'rsh_use_depth_guidance': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE,
             'rsh_depth_mask_threshold': cfg.MODEL.ROI_CUBE_HEAD.RSH_DEPTH_MASK_THRESHOLD,
             'rsh_use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_PSEUDO_WEIGHT,
+            'use_zem_adapter': cfg.MODEL.ROI_CUBE_HEAD.USE_ZEM_ADAPTER,
             'use_geometry_interpreter': use_geometry_interpreter,
             'loss_w_multi_hypothesis': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_MULTI_HYPOTHESIS,
             'use_differentiable_renderer': cfg.MODEL.ROI_CUBE_HEAD.USE_DIFFERENTIABLE_RENDERER,
@@ -1202,6 +1317,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         Ks_scaled_per_image[:, -1, -1] = 1
         needs_geometry_maps = (
             self.use_depth_roi
+            or self.use_zem_adapter
             or self.use_geometry_interpreter
             or self.use_differentiable_renderer
         )
@@ -1295,6 +1411,48 @@ class ROIHeads3D_Text(StandardROIHeads):
                     proposal_render_masks = rsh_mask_prob[:, 0].detach()
                 if self.rsh_use_depth_guidance:
                     rsh_depth_masks_flat = rsh_mask_prob[:, 0].detach()
+
+        zem_gate = None
+        if self.use_zem_adapter and self.zem_adapter is not None:
+            roi_size = cube_feature_map.shape[-1]
+            if point_map is not None:
+                zem_point_roi = roi_align_map(
+                    point_map,
+                    proposal_boxes_scaled,
+                    roi_size,
+                    spatial_scale=1.0,
+                )
+            else:
+                zem_point_roi = None
+            if ray_map is not None:
+                zem_ray_roi = roi_align_map(
+                    ray_map,
+                    proposal_boxes_scaled,
+                    roi_size,
+                    spatial_scale=1.0,
+                )
+            else:
+                zem_ray_roi = None
+            if self.training and gt_render_masks is not None:
+                zem_mask_roi = gt_render_masks
+            elif (not self.training) and proposal_render_masks is not None:
+                zem_mask_roi = proposal_render_masks
+            elif zem_point_roi is not None:
+                zem_mask_roi = (zem_point_roi[:, 2] > 0.05).float()
+            else:
+                zem_mask_roi = None
+            cube_feature_map, zem_gate = self.zem_adapter(
+                cube_feature_map,
+                point_roi=zem_point_roi,
+                ray_roi=zem_ray_roi,
+                mask_roi=zem_mask_roi,
+            )
+            if zem_gate is not None:
+                get_event_storage().put_scalar(
+                    "Cube/zem_gate_mean",
+                    float(zem_gate.detach().mean().item()),
+                    smoothing_hint=False,
+                )
         cube_features = cube_feature_map.flatten(1)
 
         n = cube_features.shape[0]

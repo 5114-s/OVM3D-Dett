@@ -175,6 +175,19 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_ROI = False
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_ADAPTER_SCALE = 1.0
 
+    # DetAny3D-style Zero-Embedding Mapping (ZEM). This injects cached metric
+    # depth point-map, camera-ray and optional mask cues after RoI pooling and
+    # before CubeHead. The final projection is zero-initialized, so enabling ZEM
+    # starts exactly from the original CubeHead feature.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_ZEM_ADAPTER = False
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_HIDDEN_DIM = 128
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_ADAPTER_SCALE = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_GATE_INIT_BIAS = -2.0
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_DEPTH = True
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_RAY = True
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_USE_MASK = True
+    cfg.MODEL.ROI_CUBE_HEAD.ZEM_DETACH_GEOMETRY = True
+
     # Training-only depth consistency regularizer. This uses cached metric depth
     # to regularize predicted object depth without adding a test-time dependency.
     cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_CONSISTENCY_LOSS = False
