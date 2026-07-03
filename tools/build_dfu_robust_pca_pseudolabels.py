@@ -183,6 +183,12 @@ def parse_args():
     parser.add_argument("--reference_min_iou", type=float, default=0.10)
     parser.add_argument("--min_weight", type=float, default=0.35)
     parser.add_argument("--unmatched_weight", type=float, default=0.60)
+    parser.add_argument("--use_imov3d_quality_weight", action="store_true")
+    parser.add_argument("--imov3d_quality_min", type=float, default=0.65)
+    parser.add_argument("--imov3d_prior_quality_strength", type=float, default=0.45)
+    parser.add_argument("--imov3d_prior_error_cap", type=float, default=2.5)
+    parser.add_argument("--imov3d_cluster_fallback_weight", type=float, default=0.88)
+    parser.add_argument("--imov3d_normal_missing_weight", type=float, default=0.95)
     parser.add_argument("--use_bev_nms", action="store_true")
     parser.add_argument("--bev_nms_iou_threshold", type=float, default=0.45)
     parser.add_argument("--bev_nms_score_weight", type=float, default=0.50)
@@ -1834,6 +1840,101 @@ def reference_match_update(ann: dict, ref_index, args) -> dict:
     return ann
 
 
+def imov3d_quality_weight_update(ann: dict, args) -> dict:
+    """Conservatively fold ImOV3D-style revision quality into pseudo weights.
+
+    The reference/ng weight still carries the main supervision confidence. This
+    extra factor only down-weights boxes whose revised geometry is suspicious:
+    size far from class prior, failed clustering, missing gravity evidence, or
+    weak projection/depth/surface support.
+    """
+    if not bool(args.use_imov3d_quality_weight):
+        return ann
+
+    if not bool(ann.get("valid3D", True)):
+        ann["imov3d_quality_weight"] = float(args.min_weight)
+        return ann
+
+    prior_error = float(
+        ann.get(
+            "surface_opt_prior_log_error",
+            ann.get("fit_prior_log_error", 0.0),
+        )
+    )
+    prior_conf = float(
+        math.exp(
+            -float(args.imov3d_prior_quality_strength)
+            * min(max(prior_error, 0.0), float(args.imov3d_prior_error_cap))
+        )
+    )
+
+    cluster_conf = 1.0
+    if bool(ann.get("dbscan_enabled", False)):
+        if bool(ann.get("dbscan_fallback", False)):
+            cluster_conf = float(args.imov3d_cluster_fallback_weight)
+        else:
+            selected_score = float(ann.get("dbscan_selected_score", 0.5))
+            keep_ratio = float(ann.get("dbscan_keep_ratio", 1.0))
+            cluster_conf = float(np.clip(0.72 + 0.20 * selected_score + 0.08 * keep_ratio, 0.55, 1.0))
+
+    normal_conf = 1.0
+    if bool(args.use_normal_ground_fusion):
+        if bool(ann.get("normal_gravity_available", False)):
+            normal_conf = float(
+                np.clip(
+                    0.88 + 0.12 * float(ann.get("normal_gravity_confidence", 0.0)),
+                    0.82,
+                    1.0,
+                )
+            )
+        else:
+            normal_conf = float(args.imov3d_normal_missing_weight)
+
+    mask_conf = 1.0
+    if bool(ann.get("mask_selector_enabled", False)):
+        mask_conf = float(
+            np.clip(0.70 + 0.30 * float(ann.get("mask_selector_score", 0.5)), 0.60, 1.0)
+        )
+
+    surface_conf = 1.0
+    if "surface_opt_depth_rel_error" in ann:
+        depth_conf = math.exp(-min(float(ann.get("surface_opt_depth_rel_error", 0.0)), 2.0))
+        support_conf = float(np.clip(float(ann.get("surface_opt_point_support", 0.5)), 0.0, 1.0))
+        silhouette_conf = float(np.clip(float(ann.get("surface_opt_silhouette_iou", 0.0)), 0.0, 1.0))
+        surface_conf = float(
+            np.clip(0.35 * depth_conf + 0.45 * support_conf + 0.20 * silhouette_conf, 0.50, 1.0)
+        )
+
+    quality = float(
+        np.clip(
+            prior_conf * cluster_conf * normal_conf * mask_conf * surface_conf,
+            float(args.imov3d_quality_min),
+            1.0,
+        )
+    )
+    ann["imov3d_prior_confidence"] = prior_conf
+    ann["imov3d_cluster_confidence"] = cluster_conf
+    ann["imov3d_normal_confidence"] = normal_conf
+    ann["imov3d_mask_confidence"] = mask_conf
+    ann["imov3d_surface_confidence"] = surface_conf
+    ann["imov3d_quality_weight"] = quality
+
+    base_weight = float(ann.get("pseudo_weight", 1.0))
+    ann["pseudo_weight_before_imov3d_quality"] = base_weight
+    ann["pseudo_weight"] = float(np.clip(base_weight * quality, float(args.min_weight), 1.0))
+
+    # Make the prior mainly affect dimensions/yaw while keeping center/depth
+    # supervision relatively stable.
+    for key in ("pseudo_weight_dims", "pseudo_weight_pose", "pseudo_weight_joint"):
+        if key in ann:
+            ann[key] = float(np.clip(float(ann[key]) * quality, float(args.min_weight), 1.0))
+    for key in ("pseudo_weight_xy", "pseudo_weight_z"):
+        if key in ann:
+            relaxed = 0.5 + 0.5 * quality
+            ann[key] = float(np.clip(float(ann[key]) * relaxed, float(args.min_weight), 1.0))
+    return ann
+
+
 def ann_bev_box(ann: dict) -> Optional[np.ndarray]:
     if not bool(ann.get("valid3D", True)):
         return None
@@ -2034,6 +2135,7 @@ def main():
                     {"dfu_reason": "small_mask", "dfu_mask_source": mask_source},
                 )
                 ann = reference_match_update(ann, ref_index, args)
+                ann = imov3d_quality_weight_update(ann, args)
                 annotations.append(ann)
                 ann_id += 1
                 continue
@@ -2065,6 +2167,7 @@ def main():
                     extra,
                 )
                 ann = reference_match_update(ann, ref_index, args)
+                ann = imov3d_quality_weight_update(ann, args)
                 annotations.append(ann)
                 ann_id += 1
                 continue
@@ -2153,6 +2256,7 @@ def main():
                             ann[box_key] = [float(x) for x in source_box]
 
             ann = reference_match_update(ann, ref_index, args)
+            ann = imov3d_quality_weight_update(ann, args)
             if bool(ann.get("valid3D", True)):
                 weight_values.append(float(ann.get("pseudo_weight", 1.0)))
             annotations.append(ann)
@@ -2189,6 +2293,8 @@ def main():
     output["info"]["imov3d_depth_edge_filter"] = bool(args.use_depth_edge_filter)
     output["info"]["imov3d_frustum_dbscan"] = bool(args.use_frustum_dbscan)
     output["info"]["imov3d_normal_ground_fusion"] = bool(args.use_normal_ground_fusion)
+    output["info"]["imov3d_quality_weight"] = bool(args.use_imov3d_quality_weight)
+    output["info"]["imov3d_quality_min"] = float(args.imov3d_quality_min)
     output["info"]["surface_box_optimization"] = bool(args.use_surface_box_optimization)
     output["info"]["surface_include_right_angle_yaws"] = bool(args.surface_include_right_angle_yaws)
     output["info"]["surface_enable_dims_swap"] = bool(args.surface_enable_dims_swap)
