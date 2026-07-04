@@ -189,6 +189,20 @@ def parse_args():
     parser.add_argument("--imov3d_prior_error_cap", type=float, default=2.5)
     parser.add_argument("--imov3d_cluster_fallback_weight", type=float, default=0.88)
     parser.add_argument("--imov3d_normal_missing_weight", type=float, default=0.95)
+    parser.add_argument("--use_projected_corner_depth_score", action="store_true")
+    parser.add_argument("--pag_front_depth_percentile", type=float, default=35.0)
+    parser.add_argument("--pag_corner_depth_radius", type=int, default=2)
+    parser.add_argument("--pag_min_corner_depth_samples", type=int, default=2)
+    parser.add_argument("--pag_min_score", type=float, default=0.60)
+    parser.add_argument("--pag_apply_to_weight", action="store_true")
+    parser.add_argument("--pag_weight_strength", type=float, default=0.35)
+    parser.add_argument("--pag_store_projection", action="store_true")
+    parser.add_argument("--use_locate3d_factorized_curriculum", action="store_true")
+    parser.add_argument("--curriculum_xy_floor", type=float, default=0.75)
+    parser.add_argument("--curriculum_z_floor", type=float, default=0.75)
+    parser.add_argument("--curriculum_dims_floor", type=float, default=0.55)
+    parser.add_argument("--curriculum_pose_floor", type=float, default=0.35)
+    parser.add_argument("--curriculum_joint_floor", type=float, default=0.45)
     parser.add_argument("--use_bev_nms", action="store_true")
     parser.add_argument("--bev_nms_iou_threshold", type=float, default=0.45)
     parser.add_argument("--bev_nms_score_weight", type=float, default=0.50)
@@ -1935,6 +1949,402 @@ def imov3d_quality_weight_update(ann: dict, args) -> dict:
     return ann
 
 
+def safe_bbox_iou_np(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+    if bbox_iou is not None:
+        return float(bbox_iou(box_a, box_b))
+    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+    bx1, by1, bx2, by2 = [float(v) for v in box_b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(ix2 - ix1, 0.0), max(iy2 - iy1, 0.0)
+    inter = iw * ih
+    area_a = max(ax2 - ax1, 0.0) * max(ay2 - ay1, 0.0)
+    area_b = max(bx2 - bx1, 0.0) * max(by2 - by1, 0.0)
+    denom = area_a + area_b - inter
+    return float(inter / denom) if denom > 1e-12 else 0.0
+
+
+def sample_depth_patch(
+    depth: np.ndarray,
+    mask: Optional[np.ndarray],
+    u: float,
+    v: float,
+    radius: int,
+) -> Optional[float]:
+    depth_np = np.asarray(depth, dtype=np.float32)
+    h, w = depth_np.shape[:2]
+    ui = int(round(float(u)))
+    vi = int(round(float(v)))
+    if ui < 0 or ui >= w or vi < 0 or vi >= h:
+        return None
+    radius = max(0, int(radius))
+    x1, x2 = max(ui - radius, 0), min(ui + radius + 1, w)
+    y1, y2 = max(vi - radius, 0), min(vi + radius + 1, h)
+    patch = depth_np[y1:y2, x1:x2]
+    valid = np.isfinite(patch) & (patch > 0.05)
+    if mask is not None:
+        mask_np = np.asarray(mask).squeeze() > 0
+        if mask_np.shape[:2] == depth_np.shape[:2]:
+            valid &= mask_np[y1:y2, x1:x2]
+    values = patch[valid]
+    if values.size == 0:
+        return None
+    return float(np.percentile(values.astype(np.float64), 35.0))
+
+
+def projected_corner_depth_score_update(
+    ann: dict,
+    depth: np.ndarray,
+    target_mask: Optional[np.ndarray],
+    target_bbox: Sequence[float],
+    K,
+    points_cam: Optional[np.ndarray],
+    prior: Sequence[float],
+    args,
+) -> dict:
+    """Add MoCA3D/PAG-style image-plane geometry evidence to one annotation.
+
+    This does not remove labels. It stores projected cuboid corners, front-depth
+    agreement, and a pixel-aligned geometry score that later becomes a soft
+    pseudo-label weight.
+    """
+    if not bool(args.use_projected_corner_depth_score):
+        return ann
+    if not bool(ann.get("valid3D", True)):
+        ann["pag_score"] = float(args.min_weight)
+        return ann
+
+    try:
+        vertices = np.asarray(ann["bbox3D_cam"], dtype=np.float64).reshape(8, 3)
+        center = np.asarray(ann["center_cam"], dtype=np.float64).reshape(3)
+        dims = np.asarray(ann["dimensions"], dtype=np.float64).reshape(3)
+        rotation = np.asarray(ann["R_cam"], dtype=np.float64).reshape(3, 3)
+        K_np = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    except Exception:
+        return ann
+    if (
+        not np.all(np.isfinite(vertices))
+        or np.any(vertices[:, 2] <= 1e-4)
+        or not np.all(np.isfinite(K_np))
+    ):
+        ann["pag_score"] = float(args.min_weight)
+        return ann
+
+    projected = vertices @ K_np.T
+    uv = projected[:, :2] / projected[:, 2:3]
+    if not np.all(np.isfinite(uv)):
+        ann["pag_score"] = float(args.min_weight)
+        return ann
+
+    depth_np = np.asarray(depth, dtype=np.float32)
+    h, w = depth_np.shape[:2]
+    in_image = (
+        (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < float(w))
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < float(h))
+    )
+    in_image_ratio = float(np.mean(in_image))
+    projected_bbox = [
+        float(np.min(uv[:, 0])),
+        float(np.min(uv[:, 1])),
+        float(np.max(uv[:, 0])),
+        float(np.max(uv[:, 1])),
+    ]
+    projection_iou = safe_bbox_iou_np(projected_bbox, target_bbox)
+    _bbox_score, silhouette_iou = projected_box_metrics(
+        vertices,
+        K_np,
+        target_bbox,
+        target_mask,
+    )
+
+    mask_bool = (
+        np.asarray(target_mask).squeeze() > 0
+        if target_mask is not None
+        else np.zeros(depth_np.shape[:2], dtype=bool)
+    )
+    valid_depth = np.isfinite(depth_np) & (depth_np > 0.05)
+    masked_values = depth_np[mask_bool & valid_depth]
+    if masked_values.size >= 4:
+        observed_front_depth = float(
+            np.percentile(
+                masked_values.astype(np.float64),
+                np.clip(float(args.pag_front_depth_percentile), 1.0, 50.0),
+            )
+        )
+    else:
+        observed_front_depth = float(np.percentile(vertices[:, 2], 10.0))
+    box_front_depth = float(np.min(vertices[:, 2]))
+    front_depth_rel_error = abs(box_front_depth - observed_front_depth) / max(
+        observed_front_depth,
+        0.10,
+    )
+    front_depth_conf = float(math.exp(-2.5 * min(front_depth_rel_error, 2.0)))
+
+    front_threshold = box_front_depth + max(0.08, 0.04 * box_front_depth)
+    front_corner_indices = np.where(vertices[:, 2] <= front_threshold)[0]
+    corner_errors = []
+    corner_depth_samples = []
+    radius = int(args.pag_corner_depth_radius)
+    for corner_idx in front_corner_indices:
+        if not in_image[corner_idx]:
+            continue
+        observed = sample_depth_patch(
+            depth_np,
+            mask_bool,
+            uv[corner_idx, 0],
+            uv[corner_idx, 1],
+            radius,
+        )
+        if observed is None:
+            continue
+        predicted = float(vertices[corner_idx, 2])
+        rel_error = abs(predicted - observed) / max(observed, 0.10)
+        corner_errors.append(float(rel_error))
+        corner_depth_samples.append(
+            {
+                "corner": int(corner_idx),
+                "u": float(uv[corner_idx, 0]),
+                "v": float(uv[corner_idx, 1]),
+                "pred_depth": predicted,
+                "obs_depth": observed,
+                "rel_error": float(rel_error),
+            }
+        )
+
+    if len(corner_errors) >= int(args.pag_min_corner_depth_samples):
+        corner_depth_rel_error = float(np.median(corner_errors))
+        corner_depth_conf = float(math.exp(-3.0 * min(corner_depth_rel_error, 2.0)))
+    else:
+        corner_depth_rel_error = front_depth_rel_error
+        # Missing projected corner samples should not kill the label; fall back
+        # to front-surface evidence but mark the evidence as weaker.
+        corner_depth_conf = float(0.75 * front_depth_conf)
+
+    support_conf = float(
+        np.clip(
+            ann.get(
+                "surface_opt_point_support",
+                point_support_3d(points_cam, center, dims, rotation) if points_cam is not None else 0.5,
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    prior_error = float(
+        ann.get("surface_opt_prior_log_error", ann.get("fit_prior_log_error", 0.0))
+    )
+    prior_conf = float(math.exp(-min(max(prior_error, 0.0), 3.0)))
+    if prior is not None and len(prior) == 3:
+        prior_arr = np.asarray([prior[0], prior[1], prior[2]], dtype=np.float64)
+        dims_error = float(
+            np.mean(
+                np.abs(
+                    np.log(
+                        np.maximum(dims, 1e-4)
+                        / np.maximum(prior_arr, 1e-4)
+                    )
+                )
+            )
+        )
+        prior_conf = max(prior_conf, float(math.exp(-min(dims_error, 3.0))))
+
+    pag_score_raw = float(
+        np.clip(
+            0.22 * projection_iou
+            + 0.18 * silhouette_iou
+            + 0.24 * front_depth_conf
+            + 0.16 * corner_depth_conf
+            + 0.12 * support_conf
+            + 0.05 * in_image_ratio
+            + 0.03 * prior_conf,
+            0.0,
+            1.0,
+        )
+    )
+    pag_score = float(
+        np.clip(pag_score_raw, float(args.pag_min_score), 1.0)
+    )
+
+    ann.update(
+        {
+            "moca3d_projected_corner_depth_score": True,
+            "moca3d_projected_bbox": [float(v) for v in projected_bbox],
+            "moca3d_projection_iou": float(projection_iou),
+            "moca3d_silhouette_iou": float(silhouette_iou),
+            "moca3d_corner_in_image_ratio": float(in_image_ratio),
+            "moca3d_box_front_depth": float(box_front_depth),
+            "moca3d_observed_front_depth": float(observed_front_depth),
+            "moca3d_front_depth_rel_error": float(front_depth_rel_error),
+            "moca3d_front_depth_confidence": float(front_depth_conf),
+            "moca3d_corner_depth_rel_error": float(corner_depth_rel_error),
+            "moca3d_corner_depth_confidence": float(corner_depth_conf),
+            "moca3d_corner_depth_samples": int(len(corner_errors)),
+            "moca3d_support_confidence": float(support_conf),
+            "moca3d_prior_confidence": float(prior_conf),
+            "pag_score_raw": float(pag_score_raw),
+            "pag_score": float(pag_score),
+        }
+    )
+    if bool(args.pag_store_projection):
+        ann["moca3d_projected_corners_2d"] = [
+            [float(v) for v in row] for row in uv.tolist()
+        ]
+        ann["moca3d_corner_depths"] = [float(v) for v in vertices[:, 2].tolist()]
+        ann["moca3d_front_corner_depth_samples"] = corner_depth_samples
+
+    if bool(args.pag_apply_to_weight):
+        strength = float(np.clip(args.pag_weight_strength, 0.0, 1.0))
+        factor = float((1.0 - strength) + strength * pag_score)
+        base_weight = float(ann.get("pseudo_weight", 1.0))
+        ann["pseudo_weight_before_pag"] = base_weight
+        ann["pseudo_weight"] = float(
+            np.clip(base_weight * factor, float(args.min_weight), 1.0)
+        )
+        relaxed = 0.5 + 0.5 * factor
+        for key in ("pseudo_weight_xy", "pseudo_weight_z"):
+            if key in ann:
+                ann[key] = float(
+                    np.clip(float(ann[key]) * relaxed, float(args.min_weight), 1.0)
+                )
+        for key in ("pseudo_weight_dims", "pseudo_weight_pose", "pseudo_weight_joint"):
+            if key in ann:
+                ann[key] = float(
+                    np.clip(float(ann[key]) * factor, float(args.min_weight), 1.0)
+                )
+    return ann
+
+
+def locate3d_factorized_curriculum_update(ann: dict, args) -> dict:
+    """LocateAnything3D-style chain weighting for pseudo supervision.
+
+    Center/depth are allowed to remain strong when 2D/depth evidence is stable;
+    dimensions are moderated by silhouette/prior/support; yaw is the most
+    conservative factor and is lowered when projected geometry is weak.
+    """
+    if not bool(args.use_locate3d_factorized_curriculum):
+        return ann
+    if not bool(ann.get("valid3D", True)):
+        return ann
+
+    base = float(np.clip(float(ann.get("pseudo_weight", 1.0)), float(args.min_weight), 1.0))
+    pag = float(np.clip(float(ann.get("pag_score", ann.get("pag_score_raw", 1.0))), 0.0, 1.0))
+    projection = float(
+        np.clip(
+            ann.get("moca3d_projection_iou", ann.get("surface_opt_bbox_iou", pag)),
+            0.0,
+            1.0,
+        )
+    )
+    silhouette = float(
+        np.clip(
+            ann.get("moca3d_silhouette_iou", ann.get("surface_opt_silhouette_iou", pag)),
+            0.0,
+            1.0,
+        )
+    )
+    depth_conf = float(
+        np.clip(
+            ann.get("moca3d_front_depth_confidence", math.exp(-min(float(ann.get("surface_opt_depth_rel_error", 0.0)), 2.0))),
+            0.0,
+            1.0,
+        )
+    )
+    corner_depth_conf = float(
+        np.clip(ann.get("moca3d_corner_depth_confidence", depth_conf), 0.0, 1.0)
+    )
+    support = float(
+        np.clip(
+            ann.get("surface_opt_point_support", ann.get("fit_inside_ratio", 0.5)),
+            0.0,
+            1.0,
+        )
+    )
+    prior_conf = float(
+        np.clip(
+            ann.get("moca3d_prior_confidence", ann.get("imov3d_prior_confidence", 1.0)),
+            0.0,
+            1.0,
+        )
+    )
+
+    xy_conf = float(
+        np.clip(
+            0.35 * projection + 0.25 * silhouette + 0.25 * pag + 0.15 * support,
+            float(args.curriculum_xy_floor),
+            1.0,
+        )
+    )
+    z_conf = float(
+        np.clip(
+            0.45 * depth_conf + 0.25 * corner_depth_conf + 0.20 * pag + 0.10 * support,
+            float(args.curriculum_z_floor),
+            1.0,
+        )
+    )
+    dims_conf = float(
+        np.clip(
+            0.25 * silhouette + 0.25 * support + 0.25 * prior_conf + 0.25 * pag,
+            float(args.curriculum_dims_floor),
+            1.0,
+        )
+    )
+    pose_conf = float(
+        np.clip(
+            0.35 * silhouette + 0.20 * support + 0.20 * prior_conf + 0.25 * pag,
+            float(args.curriculum_pose_floor),
+            1.0,
+        )
+    )
+
+    base_boost = 0.5 + 0.5 * base
+    prev = {
+        "xy": float(ann.get("pseudo_weight_xy", base)),
+        "z": float(ann.get("pseudo_weight_z", base)),
+        "dims": float(ann.get("pseudo_weight_dims", base)),
+        "pose": float(ann.get("pseudo_weight_pose", base)),
+        "joint": float(ann.get("pseudo_weight_joint", base)),
+    }
+    xy_weight = max(prev["xy"], xy_conf * base_boost)
+    z_weight = max(prev["z"], z_conf * base_boost)
+    dims_weight = min(prev["dims"], max(float(args.curriculum_dims_floor), dims_conf * base_boost))
+    pose_weight = min(prev["pose"], max(float(args.curriculum_pose_floor), pose_conf * base_boost))
+    joint_weight = float(
+        np.exp(
+            np.mean(
+                np.log(
+                    np.maximum(
+                        [xy_weight, z_weight, dims_weight, pose_weight],
+                        1e-4,
+                    )
+                )
+            )
+        )
+    )
+    joint_weight = float(
+        np.clip(joint_weight, float(args.curriculum_joint_floor), 1.0)
+    )
+
+    ann.update(
+        {
+            "locate3d_factorized_curriculum": True,
+            "locate3d_curriculum_xy_conf": xy_conf,
+            "locate3d_curriculum_z_conf": z_conf,
+            "locate3d_curriculum_dims_conf": dims_conf,
+            "locate3d_curriculum_pose_conf": pose_conf,
+            "pseudo_weight_before_locate3d_curriculum": base,
+            "pseudo_weight_xy": float(np.clip(xy_weight, float(args.min_weight), 1.0)),
+            "pseudo_weight_z": float(np.clip(z_weight, float(args.min_weight), 1.0)),
+            "pseudo_weight_dims": float(np.clip(dims_weight, float(args.min_weight), 1.0)),
+            "pseudo_weight_pose": float(np.clip(pose_weight, float(args.min_weight), 1.0)),
+            "pseudo_weight_joint": float(np.clip(joint_weight, float(args.min_weight), 1.0)),
+            "pseudo_weight": float(np.clip(joint_weight, float(args.min_weight), 1.0)),
+        }
+    )
+    return ann
+
+
 def ann_bev_box(ann: dict) -> Optional[np.ndarray]:
     if not bool(ann.get("valid3D", True)):
         return None
@@ -2045,6 +2455,7 @@ def main():
     annotations = []
     stats = defaultdict(int)
     weight_values = []
+    pag_values = []
     ann_id = 1
     source_anchor_index = build_source_anchor_index(source) if args.use_source_geometry_anchor else None
 
@@ -2258,7 +2669,21 @@ def main():
             ann = reference_match_update(ann, ref_index, args)
             ann = imov3d_quality_weight_update(ann, args)
             if bool(ann.get("valid3D", True)):
+                ann = projected_corner_depth_score_update(
+                    ann,
+                    depth,
+                    clean_mask,
+                    bbox,
+                    K,
+                    filtered_points,
+                    prior,
+                    args,
+                )
+                ann = locate3d_factorized_curriculum_update(ann, args)
+            if bool(ann.get("valid3D", True)):
                 weight_values.append(float(ann.get("pseudo_weight", 1.0)))
+                if "pag_score" in ann:
+                    pag_values.append(float(ann.get("pag_score", 0.0)))
             annotations.append(ann)
             ann_id += 1
 
@@ -2267,6 +2692,11 @@ def main():
         float(ann.get("pseudo_weight", 1.0))
         for ann in annotations
         if bool(ann.get("valid3D", True))
+    ]
+    pag_values = [
+        float(ann.get("pag_score", 0.0))
+        for ann in annotations
+        if bool(ann.get("valid3D", True)) and "pag_score" in ann
     ]
 
     output = {
@@ -2295,6 +2725,9 @@ def main():
     output["info"]["imov3d_normal_ground_fusion"] = bool(args.use_normal_ground_fusion)
     output["info"]["imov3d_quality_weight"] = bool(args.use_imov3d_quality_weight)
     output["info"]["imov3d_quality_min"] = float(args.imov3d_quality_min)
+    output["info"]["moca3d_projected_corner_depth_score"] = bool(args.use_projected_corner_depth_score)
+    output["info"]["pag_apply_to_weight"] = bool(args.pag_apply_to_weight)
+    output["info"]["locate3d_factorized_curriculum"] = bool(args.use_locate3d_factorized_curriculum)
     output["info"]["surface_box_optimization"] = bool(args.use_surface_box_optimization)
     output["info"]["surface_include_right_angle_yaws"] = bool(args.surface_include_right_angle_yaws)
     output["info"]["surface_enable_dims_swap"] = bool(args.surface_enable_dims_swap)
@@ -2307,6 +2740,8 @@ def main():
         output["info"]["pseudo_label_reference_json"] = os.path.abspath(args.reference_json)
     if weight_values:
         output["info"]["ng_mean_pseudo_weight"] = float(np.mean(weight_values))
+    if pag_values:
+        output["info"]["pag_mean_score"] = float(np.mean(pag_values))
 
     os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
     with open(args.output_json, "w") as f:
@@ -2320,6 +2755,10 @@ def main():
         stats["pseudo_weight_mean_x1000"] = int(round(float(np.mean(weight_values)) * 1000))
         stats["pseudo_weight_p10_x1000"] = int(round(float(np.percentile(weight_values, 10)) * 1000))
         stats["pseudo_weight_p50_x1000"] = int(round(float(np.percentile(weight_values, 50)) * 1000))
+    if pag_values:
+        stats["pag_score_mean_x1000"] = int(round(float(np.mean(pag_values)) * 1000))
+        stats["pag_score_p10_x1000"] = int(round(float(np.percentile(pag_values, 10)) * 1000))
+        stats["pag_score_p50_x1000"] = int(round(float(np.percentile(pag_values, 50)) * 1000))
 
     print(f"Wrote {args.output_json}")
     print(dict(stats))

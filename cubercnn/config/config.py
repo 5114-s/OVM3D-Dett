@@ -197,6 +197,15 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE = "center"
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE = 0.35
 
+    # MoCA3D-inspired projected corner-depth auxiliary supervision. The main
+    # CubeHead still predicts the standard 3D box; this loss only asks the
+    # projected 8 cuboid corners and their depths to stay consistent with the
+    # pseudo 3D label in image space.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_PROJECTED_CORNER_DEPTH_AUX = False
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_2D = 0.03
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_DEPTH = 0.03
+    cfg.MODEL.ROI_CUBE_HEAD.PROJECTED_CORNER_MAX_LOSS = 1.0
+
     # MonoDGP-style Region Segmentation Head (RSH). It distills cached
     # SAM/SAM2 masks into a lightweight RoI foreground map, then uses a
     # zero-initialized adapter to inject foreground-aware features.

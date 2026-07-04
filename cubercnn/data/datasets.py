@@ -406,6 +406,7 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
         "pseudo_weight", "ng_consistency_score",
         "pseudo_weight_xy", "pseudo_weight_z", "pseudo_weight_dims",
         "pseudo_weight_pose", "pseudo_weight_joint",
+        "pag_score", "moca3d_projected_corner_depth_score",
         "pseudo_mask_index",
     ]
     

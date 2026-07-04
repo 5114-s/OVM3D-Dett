@@ -454,11 +454,20 @@ def annotations_to_instances(annos, image_size, unknown_categories):
             for anno in annos
         ]
         target.gt_render_masks = torch.stack(render_masks, dim=0)
+        target.gt_pag_score = torch.FloatTensor([
+            float(anno.get("pag_score", 1.0)) for anno in annos
+        ]).clamp(0.05, 1.0)
+        target.gt_projected_corner_depth_score = torch.FloatTensor([
+            float(anno.get("moca3d_projected_corner_depth_score", 1.0))
+            for anno in annos
+        ]).clamp(0.05, 1.0)
     else:
         target.gt_pseudo_weight = torch.FloatTensor([])
         for factor_name in ("xy", "z", "dims", "pose", "joint"):
             target.set(f"gt_pseudo_weight_{factor_name}", torch.FloatTensor([]))
         target.gt_render_masks = torch.empty((0, 28, 28), dtype=torch.float32)
+        target.gt_pag_score = torch.FloatTensor([])
+        target.gt_projected_corner_depth_score = torch.FloatTensor([])
     
     n = len(target.gt_classes)
 

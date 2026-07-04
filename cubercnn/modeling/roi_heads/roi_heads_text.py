@@ -339,6 +339,10 @@ class ROIHeads3D_Text(StandardROIHeads):
         depth_consistency_center_crop=None,
         depth_consistency_mode=None,
         depth_consistency_percentile=None,
+        use_projected_corner_depth_aux=None,
+        loss_w_projected_corner_2d=None,
+        loss_w_projected_corner_depth=None,
+        projected_corner_max_loss=None,
         use_region_segmentation_head=None,
         loss_w_region_segmentation=None,
         rsh_use_depth_guidance=None,
@@ -382,6 +386,10 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.depth_consistency_percentile = float(
             0.35 if depth_consistency_percentile is None else depth_consistency_percentile
         )
+        self.use_projected_corner_depth_aux = bool(use_projected_corner_depth_aux)
+        self.loss_w_projected_corner_2d = float(loss_w_projected_corner_2d or 0.0)
+        self.loss_w_projected_corner_depth = float(loss_w_projected_corner_depth or 0.0)
+        self.projected_corner_max_loss = float(projected_corner_max_loss or 1.0)
         self.region_segmentation_head = region_segmentation_head
         self.use_region_segmentation_head = bool(use_region_segmentation_head)
         self.loss_w_region_segmentation = float(loss_w_region_segmentation or 0.0)
@@ -629,6 +637,10 @@ class ROIHeads3D_Text(StandardROIHeads):
             'depth_consistency_center_crop': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP,
             'depth_consistency_mode': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE,
             'depth_consistency_percentile': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE,
+            'use_projected_corner_depth_aux': cfg.MODEL.ROI_CUBE_HEAD.USE_PROJECTED_CORNER_DEPTH_AUX,
+            'loss_w_projected_corner_2d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_2D,
+            'loss_w_projected_corner_depth': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_DEPTH,
+            'projected_corner_max_loss': cfg.MODEL.ROI_CUBE_HEAD.PROJECTED_CORNER_MAX_LOSS,
             'use_region_segmentation_head': cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD,
             'loss_w_region_segmentation': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION,
             'rsh_use_depth_guidance': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE,
@@ -1289,6 +1301,32 @@ class ROIHeads3D_Text(StandardROIHeads):
                     ).to(gt_boxes3D.device)
                 else:
                     gt_factor_weights[factor_name] = gt_pseudo_weight
+            if len(proposals) and proposals[0].has("gt_pag_score"):
+                gt_pag_score = torch.cat(
+                    [p.gt_pag_score for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device).clamp(0.05, 1.0)
+            else:
+                gt_pag_score = torch.ones_like(
+                    gt_pseudo_weight,
+                    dtype=torch.float32,
+                    device=gt_boxes3D.device,
+                )
+            if len(proposals) and proposals[0].has("gt_projected_corner_depth_score"):
+                gt_projected_corner_depth_score = torch.cat(
+                    [p.gt_projected_corner_depth_score for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device).clamp(0.05, 1.0)
+            else:
+                gt_projected_corner_depth_score = torch.ones_like(
+                    gt_pseudo_weight,
+                    dtype=torch.float32,
+                    device=gt_boxes3D.device,
+                )
+            gt_corner_aux_quality = torch.minimum(
+                gt_pag_score,
+                gt_projected_corner_depth_score,
+            ).clamp(0.05, 1.0)
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
 
         # eval on all instances
@@ -2205,6 +2243,170 @@ class ROIHeads3D_Text(StandardROIHeads):
                     storage.put_scalar(
                         prefix + f'pseudo_weight_{factor_name}',
                         factor_weight.mean().item(),
+                        smoothing_hint=False,
+                    )
+
+            if (
+                self.use_projected_corner_depth_aux
+                and (
+                    self.loss_w_projected_corner_2d > 0
+                    or self.loss_w_projected_corner_depth > 0
+                )
+            ):
+                pred_x3d_corner = cube_z * (
+                    cube_x - Ks_scaled_per_box[:, 0, 2]
+                ) / Ks_scaled_per_box[:, 0, 0]
+                pred_y3d_corner = cube_z * (
+                    cube_y - Ks_scaled_per_box[:, 1, 2]
+                ) / Ks_scaled_per_box[:, 1, 1]
+                pred_box3d_corner = torch.cat(
+                    (
+                        torch.stack(
+                            (pred_x3d_corner, pred_y3d_corner, cube_z),
+                            dim=1,
+                        ),
+                        cube_dims,
+                    ),
+                    dim=1,
+                )
+                pred_corners_aux = util.get_cuboid_verts_faces(
+                    pred_box3d_corner,
+                    cube_pose,
+                )[0]
+                pred_corner_depth = pred_corners_aux[:, :, 2]
+                gt_corner_depth = gt_corners[:, :, 2]
+                valid_corners = (
+                    torch.isfinite(pred_corners_aux).all(dim=2)
+                    & torch.isfinite(gt_corners).all(dim=2)
+                    & (pred_corner_depth > 0.05)
+                    & (gt_corner_depth > 0.05)
+                )
+                valid_counts = valid_corners.float().sum(dim=1)
+                valid_boxes = valid_counts >= 4.0
+
+                if valid_boxes.any():
+                    pred_proj_corners = torch.bmm(
+                        Ks_scaled_per_box,
+                        pred_corners_aux.transpose(1, 2),
+                    ).transpose(1, 2)
+                    gt_proj_corners = torch.bmm(
+                        Ks_scaled_per_box,
+                        gt_corners.transpose(1, 2),
+                    ).transpose(1, 2)
+                    pred_uv = (
+                        pred_proj_corners[:, :, :2]
+                        / pred_proj_corners[:, :, 2:3].clamp(min=1e-4)
+                    )
+                    gt_uv = (
+                        gt_proj_corners[:, :, :2]
+                        / gt_proj_corners[:, :, 2:3].clamp(min=1e-4)
+                    )
+                    corner_scale = src_scales.clamp(min=1.0).view(-1, 1, 1)
+                    corner_valid_weight = valid_corners.float()
+                    corner_2d_residual = F.smooth_l1_loss(
+                        pred_uv / corner_scale,
+                        gt_uv / corner_scale,
+                        reduction="none",
+                        beta=0.02,
+                    ).sum(dim=2)
+                    corner_2d_residual = torch.where(
+                        valid_corners,
+                        corner_2d_residual,
+                        torch.zeros_like(corner_2d_residual),
+                    )
+                    loss_projected_corner_2d = (
+                        corner_2d_residual * corner_valid_weight
+                    ).sum(dim=1) / valid_counts.clamp(min=1.0)
+                    loss_projected_corner_2d = loss_projected_corner_2d.clamp(
+                        max=self.projected_corner_max_loss
+                    )
+
+                    corner_depth_residual = F.smooth_l1_loss(
+                        torch.log(pred_corner_depth.clamp(0.05, 80.0)),
+                        torch.log(gt_corner_depth.clamp(0.05, 80.0)),
+                        reduction="none",
+                        beta=0.05,
+                    )
+                    corner_depth_residual = torch.where(
+                        valid_corners,
+                        corner_depth_residual,
+                        torch.zeros_like(corner_depth_residual),
+                    )
+                    loss_projected_corner_depth = (
+                        corner_depth_residual * corner_valid_weight
+                    ).sum(dim=1) / valid_counts.clamp(min=1.0)
+                    loss_projected_corner_depth = (
+                        loss_projected_corner_depth.clamp(
+                            max=self.projected_corner_max_loss
+                        )
+                    )
+
+                    if self.use_factorized_pseudo_weight:
+                        corner_2d_weight = gt_factor_weights["joint"].to(
+                            cube_z.device
+                        ).clamp(0.05, 1.0)
+                        corner_depth_weight = torch.minimum(
+                            gt_factor_weights["z"].to(cube_z.device),
+                            gt_factor_weights["dims"].to(cube_z.device),
+                        ).clamp(0.05, 1.0)
+                    elif self.use_pseudo_weight and gt_pseudo_weight.numel() == n:
+                        corner_2d_weight = gt_pseudo_weight.to(cube_z.device).clamp(
+                            0.05,
+                            1.0,
+                        )
+                        corner_depth_weight = corner_2d_weight
+                    else:
+                        corner_2d_weight = torch.ones_like(cube_z)
+                        corner_depth_weight = torch.ones_like(cube_z)
+
+                    corner_aux_quality = gt_corner_aux_quality.to(cube_z.device)
+                    corner_2d_weight = (
+                        corner_2d_weight * corner_aux_quality
+                    ).clamp(0.05, 1.0)
+                    corner_depth_weight = (
+                        corner_depth_weight * corner_aux_quality
+                    ).clamp(0.05, 1.0)
+
+                    if self.loss_w_projected_corner_2d > 0:
+                        loss_2d_valid = (
+                            loss_projected_corner_2d[valid_boxes]
+                            * corner_2d_weight[valid_boxes]
+                        )
+                        losses[prefix + "loss_projected_corner_2d"] = (
+                            self.safely_reduce_losses(loss_2d_valid)
+                            * self.loss_w_projected_corner_2d
+                            * self.loss_w_3d
+                        )
+
+                    if self.loss_w_projected_corner_depth > 0:
+                        loss_depth_valid = (
+                            loss_projected_corner_depth[valid_boxes]
+                            * corner_depth_weight[valid_boxes]
+                        )
+                        losses[prefix + "loss_projected_corner_depth"] = (
+                            self.safely_reduce_losses(loss_depth_valid)
+                            * self.loss_w_projected_corner_depth
+                            * self.loss_w_3d
+                        )
+
+                    storage.put_scalar(
+                        prefix + "projected_corner_valid",
+                        valid_boxes.float().mean().item(),
+                        smoothing_hint=False,
+                    )
+                    storage.put_scalar(
+                        prefix + "projected_corner_2d_raw",
+                        loss_projected_corner_2d[valid_boxes].mean().item(),
+                        smoothing_hint=False,
+                    )
+                    storage.put_scalar(
+                        prefix + "projected_corner_depth_raw",
+                        loss_projected_corner_depth[valid_boxes].mean().item(),
+                        smoothing_hint=False,
+                    )
+                    storage.put_scalar(
+                        prefix + "projected_corner_aux_quality",
+                        corner_aux_quality[valid_boxes].mean().item(),
                         smoothing_hint=False,
                     )
 
