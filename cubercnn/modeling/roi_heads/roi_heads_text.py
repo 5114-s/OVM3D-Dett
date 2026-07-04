@@ -189,6 +189,38 @@ class RegionSegmentationHead(nn.Module):
         return enhanced_features, mask_logits, torch.sigmoid(mask_logits)
 
 
+class MoCA3DCornerHeatmapHead(nn.Module):
+    """Lightweight 8-corner heatmap head for MoCA3D-style auxiliary geometry."""
+
+    def __init__(self, in_channels, hidden_dim=128, heatmap_size=28):
+        super().__init__()
+        hidden_dim = max(16, int(hidden_dim))
+        num_groups = min(8, hidden_dim)
+        while hidden_dim % num_groups != 0 and num_groups > 1:
+            num_groups -= 1
+        self.heatmap_size = int(heatmap_size)
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.corner_logits = nn.Conv2d(hidden_dim, 8, kernel_size=1)
+
+    def forward(self, roi_features):
+        logits = self.corner_logits(self.layers(roi_features))
+        if logits.shape[-1] != self.heatmap_size:
+            logits = F.interpolate(
+                logits,
+                size=(self.heatmap_size, self.heatmap_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return logits
+
+
 class ZeroEmbeddingGeometryAdapter(nn.Module):
     """
     DetAny3D-style zero-init geometry adapter.
@@ -309,6 +341,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         soft_renderer: nn.Module = None,
         region_segmentation_head: nn.Module = None,
         zem_adapter: nn.Module = None,
+        corner_heatmap_head: nn.Module = None,
         loss_w_3d: float,
         loss_w_xy: float,
         loss_w_z: float,
@@ -343,6 +376,10 @@ class ROIHeads3D_Text(StandardROIHeads):
         loss_w_projected_corner_2d=None,
         loss_w_projected_corner_depth=None,
         projected_corner_max_loss=None,
+        use_corner_heatmap_aux=None,
+        loss_w_corner_heatmap=None,
+        corner_heatmap_sigma=None,
+        corner_heatmap_pos_weight=None,
         use_region_segmentation_head=None,
         loss_w_region_segmentation=None,
         rsh_use_depth_guidance=None,
@@ -390,6 +427,11 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.loss_w_projected_corner_2d = float(loss_w_projected_corner_2d or 0.0)
         self.loss_w_projected_corner_depth = float(loss_w_projected_corner_depth or 0.0)
         self.projected_corner_max_loss = float(projected_corner_max_loss or 1.0)
+        self.corner_heatmap_head = corner_heatmap_head
+        self.use_corner_heatmap_aux = bool(use_corner_heatmap_aux)
+        self.loss_w_corner_heatmap = float(loss_w_corner_heatmap or 0.0)
+        self.corner_heatmap_sigma = float(corner_heatmap_sigma or 1.5)
+        self.corner_heatmap_pos_weight = float(corner_heatmap_pos_weight or 4.0)
         self.region_segmentation_head = region_segmentation_head
         self.use_region_segmentation_head = bool(use_region_segmentation_head)
         self.loss_w_region_segmentation = float(loss_w_region_segmentation or 0.0)
@@ -549,6 +591,13 @@ class ROIHeads3D_Text(StandardROIHeads):
         soft_renderer = None
         region_segmentation_head = None
         zem_adapter = None
+        corner_heatmap_head = None
+        if cfg.MODEL.ROI_CUBE_HEAD.USE_CORNER_HEATMAP_AUX:
+            corner_heatmap_head = MoCA3DCornerHeatmapHead(
+                in_channels=in_channels,
+                hidden_dim=max(64, in_channels // 2),
+                heatmap_size=cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_SIZE,
+            )
         if cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD:
             region_segmentation_head = RegionSegmentationHead(
                 in_channels=in_channels,
@@ -607,6 +656,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'soft_renderer': soft_renderer,
             'region_segmentation_head': region_segmentation_head,
             'zem_adapter': zem_adapter,
+            'corner_heatmap_head': corner_heatmap_head,
             'use_confidence': cfg.MODEL.ROI_CUBE_HEAD.USE_CONFIDENCE,
             'inverse_z_weight': cfg.MODEL.ROI_CUBE_HEAD.INVERSE_Z_WEIGHT,
             'loss_w_3d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D,
@@ -641,6 +691,10 @@ class ROIHeads3D_Text(StandardROIHeads):
             'loss_w_projected_corner_2d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_2D,
             'loss_w_projected_corner_depth': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_DEPTH,
             'projected_corner_max_loss': cfg.MODEL.ROI_CUBE_HEAD.PROJECTED_CORNER_MAX_LOSS,
+            'use_corner_heatmap_aux': cfg.MODEL.ROI_CUBE_HEAD.USE_CORNER_HEATMAP_AUX,
+            'loss_w_corner_heatmap': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_CORNER_HEATMAP,
+            'corner_heatmap_sigma': cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_SIGMA,
+            'corner_heatmap_pos_weight': cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_POS_WEIGHT,
             'use_region_segmentation_head': cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD,
             'loss_w_region_segmentation': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION,
             'rsh_use_depth_guidance': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE,
@@ -1224,6 +1278,57 @@ class ROIHeads3D_Text(StandardROIHeads):
             selected_geometry_cost,
         )
 
+    def build_corner_heatmap_targets(
+        self,
+        corners_3d,
+        Ks_scaled_per_box,
+        roi_boxes,
+        heatmap_size,
+        sigma,
+    ):
+        n = corners_3d.shape[0]
+        device = corners_3d.device
+        if n == 0:
+            empty = corners_3d.new_zeros((0, 8, heatmap_size, heatmap_size))
+            return empty, corners_3d.new_zeros((0, 8), dtype=torch.bool)
+
+        projected = torch.bmm(
+            Ks_scaled_per_box,
+            corners_3d.transpose(1, 2),
+        ).transpose(1, 2)
+        depths = projected[:, :, 2]
+        uv = projected[:, :, :2] / depths.clamp(min=1e-4).unsqueeze(-1)
+
+        x1 = roi_boxes[:, 0].view(n, 1)
+        y1 = roi_boxes[:, 1].view(n, 1)
+        widths = (roi_boxes[:, 2] - roi_boxes[:, 0]).clamp(min=1.0).view(n, 1)
+        heights = (roi_boxes[:, 3] - roi_boxes[:, 1]).clamp(min=1.0).view(n, 1)
+        scale = float(max(heatmap_size - 1, 1))
+        corner_x = (uv[:, :, 0] - x1) / widths * scale
+        corner_y = (uv[:, :, 1] - y1) / heights * scale
+        valid = (
+            torch.isfinite(corner_x)
+            & torch.isfinite(corner_y)
+            & torch.isfinite(depths)
+            & (depths > 0.05)
+            & (corner_x >= 0.0)
+            & (corner_x <= scale)
+            & (corner_y >= 0.0)
+            & (corner_y <= scale)
+        )
+
+        ys = torch.arange(heatmap_size, device=device, dtype=corners_3d.dtype)
+        xs = torch.arange(heatmap_size, device=device, dtype=corners_3d.dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        xx = xx.view(1, 1, heatmap_size, heatmap_size)
+        yy = yy.view(1, 1, heatmap_size, heatmap_size)
+        cx = corner_x.view(n, 8, 1, 1)
+        cy = corner_y.view(n, 8, 1, 1)
+        sigma = max(float(sigma), 0.25)
+        heatmaps = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2))
+        heatmaps = heatmaps * valid.to(heatmaps.dtype).view(n, 8, 1, 1)
+        return heatmaps.clamp(0.0, 1.0), valid
+
     # optionally, scale proposals to zoom RoI in (<1.0) our out (>1.0)
     def scale_proposals(self, proposal_boxes):
         if self.scale_roi_boxes > 0:
@@ -1491,6 +1596,13 @@ class ROIHeads3D_Text(StandardROIHeads):
                     float(zem_gate.detach().mean().item()),
                     smoothing_hint=False,
                 )
+        corner_heatmap_logits = None
+        if (
+            self.training
+            and self.use_corner_heatmap_aux
+            and self.corner_heatmap_head is not None
+        ):
+            corner_heatmap_logits = self.corner_heatmap_head(cube_feature_map)
         cube_features = cube_feature_map.flatten(1)
 
         n = cube_features.shape[0]
@@ -1912,6 +2024,68 @@ class ROIHeads3D_Text(StandardROIHeads):
 
             # These are the corners which will be the target for all losses!!
             gt_corners = util.get_cuboid_verts_faces(gt_box3d, gt_poses)[0]
+
+            if (
+                self.use_corner_heatmap_aux
+                and corner_heatmap_logits is not None
+                and self.loss_w_corner_heatmap > 0
+            ):
+                corner_heatmap_boxes = torch.cat(
+                    [boxes.tensor for boxes in proposal_boxes_scaled],
+                    dim=0,
+                ).to(gt_corners.device)
+                corner_targets, corner_valid = self.build_corner_heatmap_targets(
+                    gt_corners.detach(),
+                    Ks_scaled_per_box,
+                    corner_heatmap_boxes,
+                    corner_heatmap_logits.shape[-1],
+                    self.corner_heatmap_sigma,
+                )
+                valid_corner_boxes = corner_valid.any(dim=1)
+                if valid_corner_boxes.any():
+                    heatmap_loss = F.binary_cross_entropy_with_logits(
+                        corner_heatmap_logits,
+                        corner_targets,
+                        reduction="none",
+                    )
+                    heatmap_pixel_weight = (
+                        1.0 + self.corner_heatmap_pos_weight * corner_targets
+                    )
+                    heatmap_loss = (
+                        heatmap_loss * heatmap_pixel_weight
+                    ).mean(dim=(1, 2, 3))
+                    if self.use_factorized_pseudo_weight:
+                        heatmap_weight = gt_factor_weights["joint"].to(
+                            heatmap_loss.device
+                        ).clamp(0.05, 1.0)
+                    elif self.use_pseudo_weight and gt_pseudo_weight.numel() == n:
+                        heatmap_weight = gt_pseudo_weight.to(
+                            heatmap_loss.device
+                        ).clamp(0.05, 1.0)
+                    else:
+                        heatmap_weight = torch.ones_like(heatmap_loss)
+                    heatmap_weight = (
+                        heatmap_weight
+                        * gt_corner_aux_quality.to(heatmap_loss.device)
+                    ).clamp(0.05, 1.0)
+                    losses[prefix + "loss_corner_heatmap"] = (
+                        self.safely_reduce_losses(
+                            heatmap_loss[valid_corner_boxes]
+                            * heatmap_weight[valid_corner_boxes]
+                        )
+                        * self.loss_w_corner_heatmap
+                        * self.loss_w_3d
+                    )
+                    storage.put_scalar(
+                        prefix + "corner_heatmap_valid",
+                        valid_corner_boxes.float().mean().item(),
+                        smoothing_hint=False,
+                    )
+                    storage.put_scalar(
+                        prefix + "corner_heatmap_raw",
+                        heatmap_loss[valid_corner_boxes].mean().item(),
+                        smoothing_hint=False,
+                    )
 
             if (
                 self.use_differentiable_renderer

@@ -5,6 +5,7 @@ OUT_DIR="${OUT_DIR:-datasets/Omni3D_pl-sor-refine-fast}"
 STATS_DIR="${STATS_DIR:-outputs/sor_refine_fast_stats}"
 SOURCE_DIR="${SOURCE_DIR:-datasets/Omni3D_pl-1}"
 REFERENCE_DIR="${REFERENCE_DIR:-datasets/Omni3D_pl-ng-weighted}"
+PSEUDO_ROOT="${PSEUDO_ROOT:-pseudo_label}"
 MAX_IMAGES_ARGS=()
 if [[ -n "${MAX_IMAGES:-}" ]]; then
   MAX_IMAGES_ARGS=(--max_images "${MAX_IMAGES}")
@@ -16,7 +17,7 @@ mkdir -p "${OUT_DIR}" "${STATS_DIR}"
 # local cuboid search. Candidate count is roughly 24 per instance instead of
 # ~1900 in the light/full settings.
 COMMON_ARGS=(
-  --pseudo_root pseudo_label
+  --pseudo_root "${PSEUDO_ROOT}"
   --dataset SUNRGBD
   --use_depth_edge_filter
   --depth_edge_rel_threshold 0.025

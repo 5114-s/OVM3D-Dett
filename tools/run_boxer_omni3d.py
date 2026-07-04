@@ -109,12 +109,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thresh3d", type=float, default=0.15)
     parser.add_argument(
         "--box_source",
-        choices=["json", "gsam", "original_gsam", "external_2d", "detany3d"],
+        choices=["json", "gsam", "original_gsam", "external_2d", "detic", "detany3d"],
         default="json",
         help=(
             "Use 2D boxes from input JSON, generate them with Grounding-SAM2, "
             "read original OVM3D Step-2 pseudo_label/<dataset>/<split>/info.pth, "
-            "read an external 2D aggregator JSON, or read DetAny3D inference output."
+            "read an external 2D aggregator JSON, read Detic proposals, "
+            "or read DetAny3D inference output."
         ),
     )
     parser.add_argument(
@@ -167,6 +168,31 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Drop DetAny3D proposals below this score before Boxer.",
+    )
+    parser.add_argument(
+        "--detic_json",
+        default=None,
+        help=(
+            "Detic external_2d JSON for --box_source detic. If omitted, "
+            "--external_2d_json is used as a fallback."
+        ),
+    )
+    parser.add_argument(
+        "--detic_root",
+        default="",
+        help="Root path used to resolve relative Detic mask_path values.",
+    )
+    parser.add_argument(
+        "--detic_bbox_format",
+        choices=["xyxy", "xywh"],
+        default="xyxy",
+        help="BBox format in Detic proposal JSON.",
+    )
+    parser.add_argument(
+        "--detic_score_threshold",
+        type=float,
+        default=0.0,
+        help="Drop Detic proposals below this score before Boxer.",
     )
     parser.add_argument(
         "--depth_source",
@@ -2632,6 +2658,21 @@ def main() -> None:
             sem_id_to_name,
             detany3d_args,
         )
+    elif args.box_source == "detic":
+        detic_json = args.detic_json or args.external_2d_json
+        if not detic_json:
+            raise ValueError("--detic_json is required when --box_source detic")
+        detic_args = copy.copy(args)
+        detic_args.external_2d_root = args.detic_root or args.external_2d_root
+        detic_args.external_2d_bbox_format = args.detic_bbox_format
+        detic_args.external_2d_score_threshold = args.detic_score_threshold
+        grouped, external_2d_stats = build_external_2d_grouped(
+            detic_json,
+            images_by_id,
+            cat_name_to_id,
+            sem_id_to_name,
+            detic_args,
+        )
 
     original_gsam_info = None
     original_gsam_info_path = None
@@ -2722,6 +2763,9 @@ def main() -> None:
         else None,
         "detany3d_json": os.path.abspath(args.detany3d_json)
         if args.detany3d_json is not None
+        else None,
+        "detic_json": os.path.abspath(args.detic_json)
+        if args.detic_json is not None
         else None,
         "external_2d_stats": external_2d_stats,
         "category_priors": len(category_prior),
@@ -2835,7 +2879,7 @@ def main() -> None:
                 stats["images_with_masks"] += 1
         else:
             entries = grouped.get(img_id, [])
-            if args.box_source in ("external_2d", "detany3d"):
+            if args.box_source in ("external_2d", "detic", "detany3d"):
                 stats["gsam_raw_2d"] += len(entries)
                 if any(entry.mask is not None for entry in entries):
                     stats["images_with_masks"] += 1
@@ -2992,6 +3036,12 @@ def main() -> None:
         )
         output["info"]["detany3d_bbox_format"] = args.detany3d_bbox_format
         output["info"]["detany3d_score_threshold"] = args.detany3d_score_threshold
+    if args.box_source == "detic":
+        output["info"]["detic_json"] = os.path.abspath(
+            args.detic_json or args.external_2d_json
+        )
+        output["info"]["detic_bbox_format"] = args.detic_bbox_format
+        output["info"]["detic_score_threshold"] = args.detic_score_threshold
 
     with open(args.output_json, "w") as f:
         json.dump(output, f)

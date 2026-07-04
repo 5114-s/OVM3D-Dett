@@ -5,6 +5,7 @@ OUT_DIR="${OUT_DIR:-datasets/Omni3D_pl-full-geometry}"
 STATS_DIR="${STATS_DIR:-outputs/full_geometry_pseudolabel_stats}"
 SOURCE_DIR="${SOURCE_DIR:-datasets/Omni3D_pl-1}"
 REFERENCE_DIR="${REFERENCE_DIR:-datasets/Omni3D_pl-ng-weighted}"
+PSEUDO_ROOT="${PSEUDO_ROOT:-pseudo_label}"
 MAX_IMAGES_ARGS=()
 if [[ -n "${MAX_IMAGES:-}" ]]; then
   MAX_IMAGES_ARGS=(--max_images "${MAX_IMAGES}")
@@ -21,7 +22,7 @@ mkdir -p "${OUT_DIR}" "${STATS_DIR}"
 # The route is intentionally recall-preserving: labels are not hard-deleted
 # except by a loose BEV NMS duplicate filter.
 COMMON_ARGS=(
-  --pseudo_root pseudo_label
+  --pseudo_root "${PSEUDO_ROOT}"
   --dataset SUNRGBD
   --use_depth_edge_filter
   --depth_edge_rel_threshold 0.025

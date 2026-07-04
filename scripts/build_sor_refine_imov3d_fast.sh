@@ -5,6 +5,7 @@ OUT_DIR="${OUT_DIR:-datasets/Omni3D_pl-sor-imov3d-fast}"
 STATS_DIR="${STATS_DIR:-outputs/sor_imov3d_fast_stats}"
 SOURCE_DIR="${SOURCE_DIR:-datasets/Omni3D_pl-1}"
 REFERENCE_DIR="${REFERENCE_DIR:-datasets/Omni3D_pl-ng-weighted}"
+PSEUDO_ROOT="${PSEUDO_ROOT:-pseudo_label}"
 IMOV3D_QUALITY_MIN="${IMOV3D_QUALITY_MIN:-0.65}"
 IMOV3D_PRIOR_QUALITY_STRENGTH="${IMOV3D_PRIOR_QUALITY_STRENGTH:-0.45}"
 BEV_NMS_IOU_THRESHOLD="${BEV_NMS_IOU_THRESHOLD:-0.65}"
@@ -23,7 +24,7 @@ mkdir -p "${OUT_DIR}" "${STATS_DIR}"
 #   3) class-prior quality weighting,
 # while keeping the fast yaw90/dims-swap surface optimization profile.
 COMMON_ARGS=(
-  --pseudo_root pseudo_label
+  --pseudo_root "${PSEUDO_ROOT}"
   --dataset SUNRGBD
   --use_depth_edge_filter
   --depth_edge_rel_threshold 0.025
