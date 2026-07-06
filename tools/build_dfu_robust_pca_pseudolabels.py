@@ -2370,7 +2370,8 @@ def projected_corner_depth_score_update(
 
     ann.update(
         {
-            "moca3d_projected_corner_depth_score": True,
+            "moca3d_projected_corner_depth_enabled": True,
+            "moca3d_projected_corner_depth_score": float(pag_score),
             "moca3d_projected_bbox": [float(v) for v in projected_bbox],
             "moca3d_projection_iou": float(projection_iou),
             "moca3d_silhouette_iou": float(silhouette_iou),
@@ -2916,6 +2917,17 @@ def main():
                 )
                 ann = locate3d_factorized_curriculum_update(ann, args)
             ann = external_strict_3d_update(ann, args, stats)
+            if bool(ann.get("valid3D", True)):
+                if bool(ann.get("dbscan_enabled", False)):
+                    stats["dfu3d_cluster_cleaning_seen"] += 1
+                    if not bool(ann.get("dbscan_fallback", False)):
+                        stats["dfu3d_cluster_cleaning_applied"] += 1
+                if bool(ann.get("normal_gravity_available", False)):
+                    stats["imov3d_normal_gravity_available"] += 1
+                if "imov3d_quality_weight" in ann:
+                    stats["imov3d_quality_weighted"] += 1
+                if bool(ann.get("moca3d_projected_corner_depth_enabled", False)):
+                    stats["moca3d_corner_depth_scored"] += 1
             if bool(ann.get("valid3D", True)):
                 weight_values.append(float(ann.get("pseudo_weight", 1.0)))
                 if "pag_score" in ann:

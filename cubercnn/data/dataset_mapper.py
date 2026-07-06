@@ -457,10 +457,13 @@ def annotations_to_instances(annos, image_size, unknown_categories):
         target.gt_pag_score = torch.FloatTensor([
             float(anno.get("pag_score", 1.0)) for anno in annos
         ]).clamp(0.05, 1.0)
-        target.gt_projected_corner_depth_score = torch.FloatTensor([
-            float(anno.get("moca3d_projected_corner_depth_score", 1.0))
-            for anno in annos
-        ]).clamp(0.05, 1.0)
+        corner_depth_scores = []
+        for anno in annos:
+            corner_score = anno.get("moca3d_projected_corner_depth_score", 1.0)
+            if isinstance(corner_score, bool):
+                corner_score = anno.get("pag_score", 1.0) if corner_score else 0.05
+            corner_depth_scores.append(float(corner_score))
+        target.gt_projected_corner_depth_score = torch.FloatTensor(corner_depth_scores).clamp(0.05, 1.0)
     else:
         target.gt_pseudo_weight = torch.FloatTensor([])
         for factor_name in ("xy", "z", "dims", "pose", "joint"):
