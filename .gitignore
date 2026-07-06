@@ -11,6 +11,7 @@ debug_*.jpg
 *.json
 logs/
 pseudo_label_gsam_*/
+pseudo_label_gsam2_*/
 Fast-SAM3D/
 third_party/Grounded-SAM-2/
 nohup.out

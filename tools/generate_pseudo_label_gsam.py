@@ -402,8 +402,14 @@ def segment_with_grounding_sam2(
     print(f"🎯 Generating masks for {len(boxes_list)} objects...")
     h, w = image_source.shape[:2]
 
-    # 转换 boxes 到 xyxy 像素格式
-    boxes_xyxy = torch.tensor(boxes_list) * torch.tensor([w, h, w, h])
+    # GroundingDINO returns normalized cxcywh boxes. SAM2 and downstream
+    # pseudo-label cache expect pixel xyxy boxes.
+    boxes_cxcywh = torch.tensor(boxes_list, dtype=torch.float32) * torch.tensor(
+        [w, h, w, h], dtype=torch.float32
+    )
+    boxes_xyxy = box_convert(boxes=boxes_cxcywh, in_fmt="cxcywh", out_fmt="xyxy")
+    boxes_xyxy[:, 0::2].clamp_(0, max(w - 1, 0))
+    boxes_xyxy[:, 1::2].clamp_(0, max(h - 1, 0))
 
     # 设置图像
     sam2_predictor.set_image(image_source)
@@ -432,7 +438,8 @@ def segment_with_grounding_sam2(
     masks_np = masks_np.astype(bool)
     indices = remove_duplicate_masks(masks_np, conf_list, iou_threshold=iou_threshold)
 
-    boxes_list = [boxes_list[i] for i in indices]
+    boxes_xyxy_np = boxes_xyxy.cpu().numpy()
+    boxes_list = [boxes_xyxy_np[i] for i in indices]
     conf_list = [conf_list[i] for i in indices]
     phrases_list = [phrases_list[i] for i in indices]
     masks_np = [masks_np[i] for i in indices]
