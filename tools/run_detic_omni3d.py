@@ -179,6 +179,32 @@ def load_detic_demo(args: argparse.Namespace, vocabulary: str):
     add_detic_config(cfg)
     cfg.merge_from_file(config_file)
     cfg.merge_from_list(["MODEL.WEIGHTS", weights] + list(args.opts))
+
+    def detic_abs_path(path: str):
+        if not isinstance(path, str) or not path:
+            return path
+        if path == "rand" or os.path.isabs(path):
+            return path
+        candidate = detic_root / path
+        if candidate.exists():
+            return str(candidate)
+        return path
+
+    # Official Detic configs store metadata paths relative to the Detic repo.
+    # This wrapper is launched from OVM3D-Det, so make those paths explicit.
+    if hasattr(cfg.MODEL.ROI_BOX_HEAD, "CAT_FREQ_PATH"):
+        cfg.MODEL.ROI_BOX_HEAD.CAT_FREQ_PATH = detic_abs_path(
+            cfg.MODEL.ROI_BOX_HEAD.CAT_FREQ_PATH
+        )
+    if hasattr(cfg.MODEL.ROI_BOX_HEAD, "ZEROSHOT_WEIGHT_PATH"):
+        cfg.MODEL.ROI_BOX_HEAD.ZEROSHOT_WEIGHT_PATH = detic_abs_path(
+            cfg.MODEL.ROI_BOX_HEAD.ZEROSHOT_WEIGHT_PATH
+        )
+    if hasattr(cfg.MODEL, "TEST_CLASSIFIERS"):
+        cfg.MODEL.TEST_CLASSIFIERS = tuple(
+            detic_abs_path(path) for path in cfg.MODEL.TEST_CLASSIFIERS
+        )
+
     cfg.MODEL.RETINANET.SCORE_THRESH_TEST = float(args.score_threshold)
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(args.score_threshold)
     cfg.MODEL.PANOPTIC_FPN.COMBINE.INSTANCES_CONFIDENCE_THRESH = float(

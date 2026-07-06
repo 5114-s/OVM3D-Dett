@@ -398,6 +398,20 @@ def main() -> None:
         boxes = [box.astype(np.float32) for box in base_boxes]
         scores = [float(x) for x in base_scores.tolist()]
         phrases = [str(x).lower().strip() for x in base_phrases]
+        base_sources = list(base_entry.get("proposal_sources", []))
+        base_external_flags = list(base_entry.get("proposal_external_flags", []))
+        base_source_indices = list(base_entry.get("proposal_source_indices", []))
+        sources = []
+        external_flags = []
+        source_indices = []
+        for i in range(len(boxes)):
+            sources.append(str(base_sources[i]) if i < len(base_sources) else "groundingsam")
+            external_flags.append(
+                bool(base_external_flags[i]) if i < len(base_external_flags) else False
+            )
+            source_indices.append(
+                int(base_source_indices[i]) if i < len(base_source_indices) else int(i)
+            )
         masks = [base_masks[i].astype(bool) for i in range(min(len(boxes), base_masks.shape[0]))]
         while len(masks) < len(boxes):
             masks.append(bbox_mask(width, height, boxes[len(masks)])[None, :, :])
@@ -430,6 +444,9 @@ def main() -> None:
             boxes.append(np.asarray(prop_box, dtype=np.float32))
             scores.append(float(proposal["score"]))
             phrases.append(prop_label)
+            sources.append(str(proposal.get("source", "external_2d")))
+            external_flags.append(True)
+            source_indices.append(int(proposal.get("source_index", -1)))
             masks.append(mask[None, :, :].astype(bool))
             stats["external_added"] += 1
 
@@ -438,6 +455,9 @@ def main() -> None:
                 "boxes": np.stack(boxes, axis=0).astype(np.float32),
                 "conf": np.asarray(scores, dtype=np.float32),
                 "phrases": phrases,
+                "proposal_sources": sources,
+                "proposal_external_flags": np.asarray(external_flags, dtype=np.bool_),
+                "proposal_source_indices": np.asarray(source_indices, dtype=np.int64),
             }
             out_masks = np.stack(masks, axis=0).astype(bool)
         else:
@@ -445,6 +465,9 @@ def main() -> None:
                 "boxes": np.zeros((0, 4), dtype=np.float32),
                 "conf": np.zeros((0,), dtype=np.float32),
                 "phrases": [],
+                "proposal_sources": [],
+                "proposal_external_flags": np.zeros((0,), dtype=np.bool_),
+                "proposal_source_indices": np.zeros((0,), dtype=np.int64),
             }
             out_masks = np.zeros((0, 1, height, width), dtype=bool)
         np.save(out_mask_dir / f"{image_id}.npy", out_masks)

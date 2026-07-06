@@ -122,6 +122,24 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT = False
     cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT = False
 
+    # LocateAnything3D-style lightweight Chain-of-Sight curriculum. This is a
+    # training-only pseudo-label reweighting layer: first estimate whether the
+    # 3D target is supported by 2D/projected evidence, then apply an easy-to-hard
+    # center -> depth -> size -> yaw curriculum. It is disabled by default and
+    # does not change any existing route unless explicitly enabled.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_LOCATE3D_COS_CURRICULUM = False
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_NEAR_Z = 1.0
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_FAR_Z = 6.0
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_MIN_NEAR_WEIGHT = 0.55
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_2D_IOU_WEIGHT = 0.45
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_GEOMETRY_WEIGHT = 0.35
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_PSEUDO_WEIGHT = 0.20
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_XY_FLOOR = 0.80
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_Z_FLOOR = 0.75
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_DIMS_FLOOR = 0.45
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_POSE_FLOOR = 0.25
+    cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_JOINT_FLOOR = 0.40
+
     cfg.MODEL.DLA = CN()
 
     # Supported types for DLA backbones are...
@@ -210,6 +228,8 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_SIZE = 28
     cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_SIGMA = 1.5
     cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_POS_WEIGHT = 4.0
+    cfg.MODEL.ROI_CUBE_HEAD.CORNER_AUX_HARD_GATE = False
+    cfg.MODEL.ROI_CUBE_HEAD.CORNER_AUX_MIN_QUALITY = 0.65
 
     # MonoDGP-style Region Segmentation Head (RSH). It distills cached
     # SAM/SAM2 masks into a lightweight RoI foreground map, then uses a

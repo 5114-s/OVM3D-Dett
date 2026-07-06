@@ -366,6 +366,18 @@ class ROIHeads3D_Text(StandardROIHeads):
         use_depth_roi=None,
         use_pseudo_weight=None,
         use_factorized_pseudo_weight=None,
+        use_locate3d_cos_curriculum=None,
+        locate3d_near_z=None,
+        locate3d_far_z=None,
+        locate3d_min_near_weight=None,
+        locate3d_2d_iou_weight=None,
+        locate3d_geometry_weight=None,
+        locate3d_pseudo_weight=None,
+        locate3d_xy_floor=None,
+        locate3d_z_floor=None,
+        locate3d_dims_floor=None,
+        locate3d_pose_floor=None,
+        locate3d_joint_floor=None,
         use_depth_consistency_loss=None,
         loss_w_depth_consistency=None,
         depth_consistency_min_pixels=None,
@@ -380,6 +392,8 @@ class ROIHeads3D_Text(StandardROIHeads):
         loss_w_corner_heatmap=None,
         corner_heatmap_sigma=None,
         corner_heatmap_pos_weight=None,
+        corner_aux_hard_gate=None,
+        corner_aux_min_quality=None,
         use_region_segmentation_head=None,
         loss_w_region_segmentation=None,
         rsh_use_depth_guidance=None,
@@ -415,6 +429,32 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.use_depth_roi = bool(use_depth_roi)
         self.use_pseudo_weight = bool(use_pseudo_weight)
         self.use_factorized_pseudo_weight = bool(use_factorized_pseudo_weight)
+        self.use_locate3d_cos_curriculum = bool(use_locate3d_cos_curriculum)
+        self.locate3d_near_z = float(1.0 if locate3d_near_z is None else locate3d_near_z)
+        self.locate3d_far_z = float(6.0 if locate3d_far_z is None else locate3d_far_z)
+        self.locate3d_min_near_weight = float(
+            0.55 if locate3d_min_near_weight is None else locate3d_min_near_weight
+        )
+        self.locate3d_2d_iou_weight = float(
+            0.45 if locate3d_2d_iou_weight is None else locate3d_2d_iou_weight
+        )
+        self.locate3d_geometry_weight = float(
+            0.35 if locate3d_geometry_weight is None else locate3d_geometry_weight
+        )
+        self.locate3d_pseudo_weight = float(
+            0.20 if locate3d_pseudo_weight is None else locate3d_pseudo_weight
+        )
+        self.locate3d_xy_floor = float(0.80 if locate3d_xy_floor is None else locate3d_xy_floor)
+        self.locate3d_z_floor = float(0.75 if locate3d_z_floor is None else locate3d_z_floor)
+        self.locate3d_dims_floor = float(
+            0.45 if locate3d_dims_floor is None else locate3d_dims_floor
+        )
+        self.locate3d_pose_floor = float(
+            0.25 if locate3d_pose_floor is None else locate3d_pose_floor
+        )
+        self.locate3d_joint_floor = float(
+            0.40 if locate3d_joint_floor is None else locate3d_joint_floor
+        )
         self.use_depth_consistency_loss = bool(use_depth_consistency_loss)
         self.loss_w_depth_consistency = float(loss_w_depth_consistency or 0.0)
         self.depth_consistency_min_pixels = int(depth_consistency_min_pixels or 16)
@@ -432,6 +472,10 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.loss_w_corner_heatmap = float(loss_w_corner_heatmap or 0.0)
         self.corner_heatmap_sigma = float(corner_heatmap_sigma or 1.5)
         self.corner_heatmap_pos_weight = float(corner_heatmap_pos_weight or 4.0)
+        self.corner_aux_hard_gate = bool(corner_aux_hard_gate)
+        self.corner_aux_min_quality = float(
+            0.65 if corner_aux_min_quality is None else corner_aux_min_quality
+        )
         self.region_segmentation_head = region_segmentation_head
         self.use_region_segmentation_head = bool(use_region_segmentation_head)
         self.loss_w_region_segmentation = float(loss_w_region_segmentation or 0.0)
@@ -681,6 +725,18 @@ class ROIHeads3D_Text(StandardROIHeads):
             'use_depth_roi': use_depth_roi,
             'use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT,
             'use_factorized_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT,
+            'use_locate3d_cos_curriculum': cfg.MODEL.ROI_CUBE_HEAD.USE_LOCATE3D_COS_CURRICULUM,
+            'locate3d_near_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_NEAR_Z,
+            'locate3d_far_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_FAR_Z,
+            'locate3d_min_near_weight': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_MIN_NEAR_WEIGHT,
+            'locate3d_2d_iou_weight': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_2D_IOU_WEIGHT,
+            'locate3d_geometry_weight': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_GEOMETRY_WEIGHT,
+            'locate3d_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_PSEUDO_WEIGHT,
+            'locate3d_xy_floor': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_XY_FLOOR,
+            'locate3d_z_floor': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_Z_FLOOR,
+            'locate3d_dims_floor': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_DIMS_FLOOR,
+            'locate3d_pose_floor': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_POSE_FLOOR,
+            'locate3d_joint_floor': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_JOINT_FLOOR,
             'use_depth_consistency_loss': cfg.MODEL.ROI_CUBE_HEAD.USE_DEPTH_CONSISTENCY_LOSS,
             'loss_w_depth_consistency': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DEPTH_CONSISTENCY,
             'depth_consistency_min_pixels': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MIN_PIXELS,
@@ -695,6 +751,8 @@ class ROIHeads3D_Text(StandardROIHeads):
             'loss_w_corner_heatmap': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_CORNER_HEATMAP,
             'corner_heatmap_sigma': cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_SIGMA,
             'corner_heatmap_pos_weight': cfg.MODEL.ROI_CUBE_HEAD.CORNER_HEATMAP_POS_WEIGHT,
+            'corner_aux_hard_gate': cfg.MODEL.ROI_CUBE_HEAD.CORNER_AUX_HARD_GATE,
+            'corner_aux_min_quality': cfg.MODEL.ROI_CUBE_HEAD.CORNER_AUX_MIN_QUALITY,
             'use_region_segmentation_head': cfg.MODEL.ROI_CUBE_HEAD.USE_REGION_SEGMENTATION_HEAD,
             'loss_w_region_segmentation': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_REGION_SEGMENTATION,
             'rsh_use_depth_guidance': cfg.MODEL.ROI_CUBE_HEAD.RSH_USE_DEPTH_GUIDANCE,
@@ -1328,6 +1386,103 @@ class ROIHeads3D_Text(StandardROIHeads):
         heatmaps = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2))
         heatmaps = heatmaps * valid.to(heatmaps.dtype).view(n, 8, 1, 1)
         return heatmaps.clamp(0.0, 1.0), valid
+
+    def locate3d_cos_curriculum_weights(
+        self,
+        projected_boxes,
+        target_boxes,
+        gt_z,
+        gt_pseudo_weight,
+        gt_corner_aux_quality,
+    ):
+        """Chain-of-Sight training weights inspired by LocateAnything3D.
+
+        The original paper uses an autoregressive 2D -> 3D token curriculum.
+        Here we keep the OVM3D-Det head unchanged and translate the same idea
+        into a lightweight loss reweighting layer: reliable 2D evidence and
+        nearer objects get stronger supervision, while difficult attributes
+        (dims/yaw) are down-weighted more aggressively than center/depth.
+        """
+        projected_boxes = projected_boxes.to(gt_z.device)
+        target_boxes = target_boxes.to(gt_z.device)
+        intersection_min = torch.maximum(
+            projected_boxes[:, :2],
+            target_boxes[:, :2],
+        )
+        intersection_max = torch.minimum(
+            projected_boxes[:, 2:],
+            target_boxes[:, 2:],
+        )
+        intersection_size = (intersection_max - intersection_min).clamp(min=0.0)
+        intersection = intersection_size[:, 0] * intersection_size[:, 1]
+        projected_area = (
+            (projected_boxes[:, 2] - projected_boxes[:, 0]).clamp(min=0.0)
+            * (projected_boxes[:, 3] - projected_boxes[:, 1]).clamp(min=0.0)
+        )
+        target_area = (
+            (target_boxes[:, 2] - target_boxes[:, 0]).clamp(min=0.0)
+            * (target_boxes[:, 3] - target_boxes[:, 1]).clamp(min=0.0)
+        )
+        projection_iou = intersection / (
+            projected_area + target_area - intersection
+        ).clamp(min=1.0)
+
+        pseudo_quality = gt_pseudo_weight.to(gt_z.device).clamp(0.05, 1.0)
+        geometry_quality = gt_corner_aux_quality.to(gt_z.device).clamp(0.05, 1.0)
+        source_weight_sum = max(
+            self.locate3d_2d_iou_weight
+            + self.locate3d_geometry_weight
+            + self.locate3d_pseudo_weight,
+            1e-6,
+        )
+        evidence = (
+            self.locate3d_2d_iou_weight * projection_iou.clamp(0.0, 1.0)
+            + self.locate3d_geometry_weight * geometry_quality
+            + self.locate3d_pseudo_weight * pseudo_quality
+        ) / source_weight_sum
+        evidence = evidence.clamp(0.0, 1.0)
+
+        z_span = max(self.locate3d_far_z - self.locate3d_near_z, 1e-3)
+        near_progress = 1.0 - (
+            (gt_z.to(evidence.device).clamp(min=0.0) - self.locate3d_near_z)
+            / z_span
+        ).clamp(0.0, 1.0)
+        near_weight = (
+            self.locate3d_min_near_weight
+            + (1.0 - self.locate3d_min_near_weight) * near_progress
+        ).clamp(0.0, 1.0)
+        easy_score = (evidence * near_weight).clamp(0.0, 1.0)
+
+        xy_weight = self.locate3d_xy_floor + (
+            1.0 - self.locate3d_xy_floor
+        ) * evidence
+        z_weight = self.locate3d_z_floor + (
+            1.0 - self.locate3d_z_floor
+        ) * easy_score
+        dims_weight = self.locate3d_dims_floor + (
+            1.0 - self.locate3d_dims_floor
+        ) * easy_score.pow(1.25)
+        pose_weight = self.locate3d_pose_floor + (
+            1.0 - self.locate3d_pose_floor
+        ) * easy_score.pow(1.75)
+        joint_weight = self.locate3d_joint_floor + (
+            1.0 - self.locate3d_joint_floor
+        ) * easy_score.pow(1.50)
+
+        weights = {
+            "xy": xy_weight.clamp(0.05, 1.0),
+            "z": z_weight.clamp(0.05, 1.0),
+            "dims": dims_weight.clamp(0.05, 1.0),
+            "pose": pose_weight.clamp(0.05, 1.0),
+            "joint": joint_weight.clamp(0.05, 1.0),
+        }
+        stats = {
+            "projection_iou": projection_iou.detach(),
+            "evidence": evidence.detach(),
+            "near_weight": near_weight.detach(),
+            "easy_score": easy_score.detach(),
+        }
+        return weights, stats
 
     # optionally, scale proposals to zoom RoI in (<1.0) our out (>1.0)
     def scale_proposals(self, proposal_boxes):
@@ -2064,28 +2219,44 @@ class ROIHeads3D_Text(StandardROIHeads):
                         ).clamp(0.05, 1.0)
                     else:
                         heatmap_weight = torch.ones_like(heatmap_loss)
-                    heatmap_weight = (
-                        heatmap_weight
-                        * gt_corner_aux_quality.to(heatmap_loss.device)
-                    ).clamp(0.05, 1.0)
-                    losses[prefix + "loss_corner_heatmap"] = (
-                        self.safely_reduce_losses(
-                            heatmap_loss[valid_corner_boxes]
-                            * heatmap_weight[valid_corner_boxes]
+                    heatmap_quality = heatmap_weight * gt_corner_aux_quality.to(
+                        heatmap_loss.device
+                    )
+                    if self.corner_aux_hard_gate:
+                        valid_corner_boxes = valid_corner_boxes & (
+                            heatmap_quality >= self.corner_aux_min_quality
                         )
-                        * self.loss_w_corner_heatmap
-                        * self.loss_w_3d
-                    )
-                    storage.put_scalar(
-                        prefix + "corner_heatmap_valid",
-                        valid_corner_boxes.float().mean().item(),
-                        smoothing_hint=False,
-                    )
-                    storage.put_scalar(
-                        prefix + "corner_heatmap_raw",
-                        heatmap_loss[valid_corner_boxes].mean().item(),
-                        smoothing_hint=False,
-                    )
+                    if not valid_corner_boxes.any():
+                        storage.put_scalar(
+                            prefix + "corner_heatmap_valid",
+                            0.0,
+                            smoothing_hint=False,
+                        )
+                    else:
+                        heatmap_weight = heatmap_quality.clamp(0.05, 1.0)
+                        losses[prefix + "loss_corner_heatmap"] = (
+                            self.safely_reduce_losses(
+                                heatmap_loss[valid_corner_boxes]
+                                * heatmap_weight[valid_corner_boxes]
+                            )
+                            * self.loss_w_corner_heatmap
+                            * self.loss_w_3d
+                        )
+                        storage.put_scalar(
+                            prefix + "corner_heatmap_valid",
+                            valid_corner_boxes.float().mean().item(),
+                            smoothing_hint=False,
+                        )
+                        storage.put_scalar(
+                            prefix + "corner_heatmap_raw",
+                            heatmap_loss[valid_corner_boxes].mean().item(),
+                            smoothing_hint=False,
+                        )
+                        storage.put_scalar(
+                            prefix + "corner_heatmap_quality",
+                            heatmap_quality[valid_corner_boxes].mean().item(),
+                            smoothing_hint=False,
+                        )
 
             if (
                 self.use_differentiable_renderer
@@ -2205,6 +2376,35 @@ class ROIHeads3D_Text(StandardROIHeads):
             gt_y = gt_proj_y1 + 0.5 * gt_heights
 
             gt_proj_boxes = torch.stack((gt_proj_x1, gt_proj_y1, gt_proj_x2, gt_proj_y2), dim=1)
+
+            if self.use_locate3d_cos_curriculum:
+                target_boxes_2d = torch.cat(
+                    [boxes.tensor for boxes in depth_target_boxes],
+                    dim=0,
+                ).to(gt_proj_boxes.device)
+                locate3d_weights, locate3d_stats = self.locate3d_cos_curriculum_weights(
+                    gt_proj_boxes.detach(),
+                    target_boxes_2d,
+                    gt_z.detach(),
+                    gt_pseudo_weight.detach(),
+                    gt_corner_aux_quality.detach(),
+                )
+                for factor_name, factor_weight in locate3d_weights.items():
+                    gt_factor_weights[factor_name] = (
+                        gt_factor_weights[factor_name].to(factor_weight.device)
+                        * factor_weight
+                    ).clamp(0.05, 1.0)
+                    storage.put_scalar(
+                        prefix + f'locate3d_weight_{factor_name}',
+                        factor_weight.mean().item(),
+                        smoothing_hint=False,
+                    )
+                for stat_name, stat_value in locate3d_stats.items():
+                    storage.put_scalar(
+                        prefix + f'locate3d_{stat_name}',
+                        stat_value.mean().item(),
+                        smoothing_hint=False,
+                    )
             
             if self.disentangled_loss:
                 '''
@@ -2534,34 +2734,39 @@ class ROIHeads3D_Text(StandardROIHeads):
                         corner_depth_weight = torch.ones_like(cube_z)
 
                     corner_aux_quality = gt_corner_aux_quality.to(cube_z.device)
-                    corner_2d_weight = (
-                        corner_2d_weight * corner_aux_quality
-                    ).clamp(0.05, 1.0)
-                    corner_depth_weight = (
-                        corner_depth_weight * corner_aux_quality
-                    ).clamp(0.05, 1.0)
+                    corner_2d_quality = corner_2d_weight * corner_aux_quality
+                    corner_depth_quality = corner_depth_weight * corner_aux_quality
+                    if self.corner_aux_hard_gate:
+                        valid_boxes = valid_boxes & (
+                            torch.minimum(corner_2d_quality, corner_depth_quality)
+                            >= self.corner_aux_min_quality
+                        )
+                    corner_2d_weight = corner_2d_quality.clamp(0.05, 1.0)
+                    corner_depth_weight = corner_depth_quality.clamp(0.05, 1.0)
 
                     if self.loss_w_projected_corner_2d > 0:
                         loss_2d_valid = (
                             loss_projected_corner_2d[valid_boxes]
                             * corner_2d_weight[valid_boxes]
                         )
-                        losses[prefix + "loss_projected_corner_2d"] = (
-                            self.safely_reduce_losses(loss_2d_valid)
-                            * self.loss_w_projected_corner_2d
-                            * self.loss_w_3d
-                        )
+                        if loss_2d_valid.numel() > 0:
+                            losses[prefix + "loss_projected_corner_2d"] = (
+                                self.safely_reduce_losses(loss_2d_valid)
+                                * self.loss_w_projected_corner_2d
+                                * self.loss_w_3d
+                            )
 
                     if self.loss_w_projected_corner_depth > 0:
                         loss_depth_valid = (
                             loss_projected_corner_depth[valid_boxes]
                             * corner_depth_weight[valid_boxes]
                         )
-                        losses[prefix + "loss_projected_corner_depth"] = (
-                            self.safely_reduce_losses(loss_depth_valid)
-                            * self.loss_w_projected_corner_depth
-                            * self.loss_w_3d
-                        )
+                        if loss_depth_valid.numel() > 0:
+                            losses[prefix + "loss_projected_corner_depth"] = (
+                                self.safely_reduce_losses(loss_depth_valid)
+                                * self.loss_w_projected_corner_depth
+                                * self.loss_w_3d
+                            )
 
                     storage.put_scalar(
                         prefix + "projected_corner_valid",
@@ -2570,17 +2775,31 @@ class ROIHeads3D_Text(StandardROIHeads):
                     )
                     storage.put_scalar(
                         prefix + "projected_corner_2d_raw",
-                        loss_projected_corner_2d[valid_boxes].mean().item(),
+                        (
+                            loss_projected_corner_2d[valid_boxes].mean().item()
+                            if valid_boxes.any()
+                            else 0.0
+                        ),
                         smoothing_hint=False,
                     )
                     storage.put_scalar(
                         prefix + "projected_corner_depth_raw",
-                        loss_projected_corner_depth[valid_boxes].mean().item(),
+                        (
+                            loss_projected_corner_depth[valid_boxes].mean().item()
+                            if valid_boxes.any()
+                            else 0.0
+                        ),
                         smoothing_hint=False,
                     )
                     storage.put_scalar(
                         prefix + "projected_corner_aux_quality",
-                        corner_aux_quality[valid_boxes].mean().item(),
+                        (
+                            torch.minimum(corner_2d_quality, corner_depth_quality)[
+                                valid_boxes
+                            ].mean().item()
+                            if valid_boxes.any()
+                            else 0.0
+                        ),
                         smoothing_hint=False,
                     )
 

@@ -206,6 +206,35 @@ def parse_args():
     parser.add_argument("--use_bev_nms", action="store_true")
     parser.add_argument("--bev_nms_iou_threshold", type=float, default=0.45)
     parser.add_argument("--bev_nms_score_weight", type=float, default=0.50)
+    parser.add_argument(
+        "--use_external_strict_3d",
+        action="store_true",
+        help=(
+            "Treat external 2D proposals, such as Detic+SAM2, as recall "
+            "candidates: keep their 2D boxes but cap/down-weight noisy 3D "
+            "supervision unless geometry evidence is strong."
+        ),
+    )
+    parser.add_argument(
+        "--external_strict_sources",
+        default="detic,external_2d,detany3d",
+        help="Comma-separated source names considered external for strict 3D gating.",
+    )
+    parser.add_argument("--external_strict_min_score", type=float, default=0.35)
+    parser.add_argument("--external_strict_accept_quality", type=float, default=0.62)
+    parser.add_argument("--external_strict_low_quality", type=float, default=0.35)
+    parser.add_argument("--external_strict_high_cap", type=float, default=0.72)
+    parser.add_argument("--external_strict_mid_cap", type=float, default=0.45)
+    parser.add_argument("--external_strict_low_cap", type=float, default=0.18)
+    parser.add_argument("--external_strict_xy_floor", type=float, default=0.35)
+    parser.add_argument("--external_strict_z_floor", type=float, default=0.35)
+    parser.add_argument("--external_strict_dims_floor", type=float, default=0.12)
+    parser.add_argument("--external_strict_pose_floor", type=float, default=0.08)
+    parser.add_argument(
+        "--external_strict_mark_low_valid3d_false",
+        action="store_true",
+        help="For very weak external boxes, mark valid3D false instead of only down-weighting.",
+    )
     parser.add_argument("--stats_json", default=None)
     return parser.parse_args()
 
@@ -1854,6 +1883,178 @@ def reference_match_update(ann: dict, ref_index, args) -> dict:
     return ann
 
 
+def finite_float(value, default: float = 0.0) -> float:
+    try:
+        value_f = float(value)
+    except Exception:
+        return float(default)
+    return value_f if math.isfinite(value_f) else float(default)
+
+
+def sanitize_detection_score(score, default: float = 0.05) -> float:
+    return float(np.clip(finite_float(score, default), 0.0, 1.0))
+
+
+def split_external_sources(value: str) -> set:
+    return {item.strip().lower() for item in str(value).split(",") if item.strip()}
+
+
+def is_external_proposal(ann: dict, args) -> bool:
+    if bool(ann.get("proposal_external", False)):
+        return True
+    source = str(ann.get("proposal_source", "")).lower().strip()
+    return source in split_external_sources(args.external_strict_sources)
+
+
+def external_strict_quality(ann: dict, args) -> Tuple[float, Dict[str, float]]:
+    score = sanitize_detection_score(ann.get("score", ann.get("proposal_2d_score", 0.0)))
+    min_score = float(np.clip(args.external_strict_min_score, 0.0, 0.99))
+    score_conf = float(np.clip((score - min_score) / max(1.0 - min_score, 1e-6), 0.0, 1.0))
+
+    support = max(
+        finite_float(ann.get("surface_opt_point_support", 0.0)),
+        finite_float(ann.get("fit_inside_ratio", 0.0)),
+        finite_float(ann.get("ng_dfu_box_support", 0.0)),
+    )
+    support_conf = float(np.clip(support, 0.0, 1.0))
+
+    depth_error = min(
+        finite_float(ann.get("surface_opt_depth_rel_error", 1.0), 1.0),
+        finite_float(ann.get("ng_depth_rel_error", 1.0), 1.0),
+    )
+    depth_conf = float(np.exp(-min(max(depth_error, 0.0), 2.0) / 0.45))
+
+    projection = max(
+        finite_float(ann.get("surface_opt_bbox_iou", 0.0)),
+        finite_float(ann.get("surface_opt_silhouette_iou", 0.0)),
+        finite_float(ann.get("ng_match_iou_2d", 0.0)),
+    )
+    projection_conf = float(np.clip(projection, 0.0, 1.0))
+
+    prior_error = min(
+        finite_float(ann.get("surface_opt_prior_log_error", 2.0), 2.0),
+        finite_float(ann.get("fit_prior_log_error", 2.0), 2.0),
+        finite_float(ann.get("ng_dim_log_error", 2.0), 2.0),
+    )
+    prior_conf = float(np.exp(-min(max(prior_error, 0.0), 2.5) / 1.1))
+
+    source_anchor_conf = 1.0 if bool(ann.get("source_anchor_found", False)) else 0.65
+    if bool(ann.get("ng_match_found", False)):
+        source_anchor_conf = max(source_anchor_conf, 0.85)
+
+    quality = float(
+        np.clip(
+            0.23 * score_conf
+            + 0.25 * support_conf
+            + 0.22 * depth_conf
+            + 0.15 * projection_conf
+            + 0.10 * prior_conf
+            + 0.05 * source_anchor_conf,
+            0.0,
+            1.0,
+        )
+    )
+    details = {
+        "external_strict_score_conf": score_conf,
+        "external_strict_support_conf": support_conf,
+        "external_strict_depth_conf": depth_conf,
+        "external_strict_projection_conf": projection_conf,
+        "external_strict_prior_conf": prior_conf,
+        "external_strict_source_anchor_conf": source_anchor_conf,
+    }
+    return quality, details
+
+
+def cap_factorized_weights(
+    ann: dict,
+    *,
+    joint_cap: float,
+    xy_cap: float,
+    z_cap: float,
+    dims_cap: float,
+    pose_cap: float,
+    args,
+    min_floor: float = 0.05,
+) -> dict:
+    caps = {
+        "pseudo_weight_xy": xy_cap,
+        "pseudo_weight_z": z_cap,
+        "pseudo_weight_dims": dims_cap,
+        "pseudo_weight_pose": pose_cap,
+        "pseudo_weight_joint": joint_cap,
+        "pseudo_weight": joint_cap,
+    }
+    for key, cap in caps.items():
+        current = finite_float(ann.get(key, ann.get("pseudo_weight", 1.0)), 1.0)
+        ann[key] = float(np.clip(min(current, float(cap)), float(min_floor), 1.0))
+    return ann
+
+
+def external_strict_3d_update(ann: dict, args, stats=None) -> dict:
+    if not bool(args.use_external_strict_3d):
+        return ann
+    if not is_external_proposal(ann, args):
+        return ann
+
+    ann["external_strict_3d_enabled"] = True
+    if stats is not None:
+        stats["external_strict_seen"] += 1
+
+    if not bool(ann.get("valid3D", True)):
+        ann["pseudo_weight"] = float(args.min_weight)
+        ann["pseudo_weight_joint"] = float(args.min_weight)
+        if stats is not None:
+            stats["external_strict_invalid"] += 1
+        return ann
+
+    quality, details = external_strict_quality(ann, args)
+    ann.update(details)
+    ann["external_strict_quality"] = quality
+
+    accept_quality = float(args.external_strict_accept_quality)
+    low_quality = float(args.external_strict_low_quality)
+    if quality >= accept_quality:
+        tier = "accepted_3d"
+        joint_cap = float(args.external_strict_high_cap)
+        xy_cap = max(joint_cap, float(args.external_strict_xy_floor))
+        z_cap = max(joint_cap, float(args.external_strict_z_floor))
+        dims_cap = joint_cap
+        pose_cap = min(joint_cap, 0.60)
+        stat_key = "external_strict_accepted"
+    elif quality >= low_quality:
+        tier = "weak_3d"
+        joint_cap = float(args.external_strict_mid_cap)
+        xy_cap = max(joint_cap, float(args.external_strict_xy_floor))
+        z_cap = max(joint_cap, float(args.external_strict_z_floor))
+        dims_cap = min(joint_cap, 0.30)
+        pose_cap = min(joint_cap, 0.20)
+        stat_key = "external_strict_weak"
+    else:
+        tier = "very_weak_3d"
+        if bool(args.external_strict_mark_low_valid3d_false):
+            ann["valid3D"] = False
+        joint_cap = float(args.external_strict_low_cap)
+        xy_cap = max(joint_cap, float(args.external_strict_xy_floor))
+        z_cap = max(joint_cap, float(args.external_strict_z_floor))
+        dims_cap = max(float(args.external_strict_dims_floor), joint_cap)
+        pose_cap = max(float(args.external_strict_pose_floor), min(joint_cap, 0.15))
+        stat_key = "external_strict_very_weak"
+
+    ann["external_strict_tier"] = tier
+    cap_factorized_weights(
+        ann,
+        joint_cap=joint_cap,
+        xy_cap=xy_cap,
+        z_cap=z_cap,
+        dims_cap=dims_cap,
+        pose_cap=pose_cap,
+        args=args,
+    )
+    if stats is not None:
+        stats[stat_key] += 1
+    return ann
+
+
 def imov3d_quality_weight_update(ann: dict, args) -> dict:
     """Conservatively fold ImOV3D-style revision quality into pseudo weights.
 
@@ -2373,7 +2574,7 @@ def bev_iou_np(box_a: np.ndarray, box_b: np.ndarray) -> float:
 
 
 def annotation_nms_quality(ann: dict, args) -> float:
-    score = float(np.clip(float(ann.get("score", 1.0)), 0.0, 1.0))
+    score = sanitize_detection_score(ann.get("score", 1.0), default=0.05)
     weight = float(
         np.clip(
             float(ann.get("pseudo_weight_joint", ann.get("pseudo_weight", 1.0))),
@@ -2483,6 +2684,13 @@ def main():
         phrases = list(img_data.get("phrases", []))
         boxes = img_data.get("boxes", [])
         scores = img_data.get("conf", np.ones(len(phrases), dtype=np.float32))
+        proposal_sources = list(img_data.get("proposal_sources", []))
+        proposal_external_flags = np.asarray(
+            img_data.get("proposal_external_flags", np.zeros(len(phrases), dtype=bool))
+        ).reshape(-1)
+        proposal_source_indices = np.asarray(
+            img_data.get("proposal_source_indices", np.arange(len(phrases), dtype=np.int64))
+        ).reshape(-1)
         n = min(len(phrases), len(boxes), mask.shape[0], raw_mask.shape[0])
         stats["objects_seen"] += int(n)
         used_anchor_ids = set()
@@ -2492,9 +2700,30 @@ def main():
             category_id = category_name_to_id.get(category_name, 0)
             if category_id == 0:
                 stats["unknown_category"] += 1
-            score = float(np.asarray(scores[j]).reshape(-1)[0])
+            score = sanitize_detection_score(np.asarray(scores[j]).reshape(-1)[0])
             bbox = normalize_bbox_to_pixels(boxes[j], width, height)
-            extra = {"pseudo_mask_index": int(j)}
+            proposal_source = (
+                str(proposal_sources[j])
+                if j < len(proposal_sources)
+                else "groundingsam"
+            )
+            proposal_external = (
+                bool(proposal_external_flags[j])
+                if j < len(proposal_external_flags)
+                else False
+            )
+            proposal_source_index = (
+                int(proposal_source_indices[j])
+                if j < len(proposal_source_indices)
+                else int(j)
+            )
+            extra = {
+                "pseudo_mask_index": int(j),
+                "proposal_source": proposal_source,
+                "proposal_external": bool(proposal_external),
+                "proposal_source_index": int(proposal_source_index),
+                "proposal_2d_score": float(score),
+            }
             source_anchor, source_anchor_iou = match_source_anchor(
                 source_anchor_index,
                 used_anchor_ids,
@@ -2543,10 +2772,15 @@ def main():
                     category_id,
                     bbox,
                     score,
-                    {"dfu_reason": "small_mask", "dfu_mask_source": mask_source},
+                    {
+                        **extra,
+                        "dfu_reason": "small_mask",
+                        "dfu_mask_source": mask_source,
+                    },
                 )
                 ann = reference_match_update(ann, ref_index, args)
                 ann = imov3d_quality_weight_update(ann, args)
+                ann = external_strict_3d_update(ann, args, stats)
                 annotations.append(ann)
                 ann_id += 1
                 continue
@@ -2579,6 +2813,7 @@ def main():
                 )
                 ann = reference_match_update(ann, ref_index, args)
                 ann = imov3d_quality_weight_update(ann, args)
+                ann = external_strict_3d_update(ann, args, stats)
                 annotations.append(ann)
                 ann_id += 1
                 continue
@@ -2680,6 +2915,7 @@ def main():
                     args,
                 )
                 ann = locate3d_factorized_curriculum_update(ann, args)
+            ann = external_strict_3d_update(ann, args, stats)
             if bool(ann.get("valid3D", True)):
                 weight_values.append(float(ann.get("pseudo_weight", 1.0)))
                 if "pag_score" in ann:
@@ -2736,6 +2972,9 @@ def main():
     output["info"]["surface_require_improvement"] = bool(args.surface_require_improvement)
     output["info"]["bev_nms"] = bool(args.use_bev_nms)
     output["info"]["bev_nms_iou_threshold"] = float(args.bev_nms_iou_threshold)
+    output["info"]["external_strict_3d"] = bool(args.use_external_strict_3d)
+    output["info"]["external_strict_sources"] = str(args.external_strict_sources)
+    output["info"]["external_strict_accept_quality"] = float(args.external_strict_accept_quality)
     if args.reference_json:
         output["info"]["pseudo_label_reference_json"] = os.path.abspath(args.reference_json)
     if weight_values:
