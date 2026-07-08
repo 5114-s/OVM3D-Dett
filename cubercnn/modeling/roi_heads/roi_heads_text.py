@@ -366,6 +366,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         use_depth_roi=None,
         use_pseudo_weight=None,
         use_factorized_pseudo_weight=None,
+        factorized_pseudo_weight_min=None,
         use_locate3d_cos_curriculum=None,
         locate3d_near_z=None,
         locate3d_far_z=None,
@@ -384,6 +385,7 @@ class ROIHeads3D_Text(StandardROIHeads):
         depth_consistency_center_crop=None,
         depth_consistency_mode=None,
         depth_consistency_percentile=None,
+        depth_consistency_use_factorized_z_weight=None,
         use_projected_corner_depth_aux=None,
         loss_w_projected_corner_2d=None,
         loss_w_projected_corner_depth=None,
@@ -429,6 +431,11 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.use_depth_roi = bool(use_depth_roi)
         self.use_pseudo_weight = bool(use_pseudo_weight)
         self.use_factorized_pseudo_weight = bool(use_factorized_pseudo_weight)
+        self.factorized_pseudo_weight_min = float(
+            0.05
+            if factorized_pseudo_weight_min is None
+            else factorized_pseudo_weight_min
+        )
         self.use_locate3d_cos_curriculum = bool(use_locate3d_cos_curriculum)
         self.locate3d_near_z = float(1.0 if locate3d_near_z is None else locate3d_near_z)
         self.locate3d_far_z = float(6.0 if locate3d_far_z is None else locate3d_far_z)
@@ -462,6 +469,9 @@ class ROIHeads3D_Text(StandardROIHeads):
         self.depth_consistency_mode = str(depth_consistency_mode or "center")
         self.depth_consistency_percentile = float(
             0.35 if depth_consistency_percentile is None else depth_consistency_percentile
+        )
+        self.depth_consistency_use_factorized_z_weight = bool(
+            depth_consistency_use_factorized_z_weight
         )
         self.use_projected_corner_depth_aux = bool(use_projected_corner_depth_aux)
         self.loss_w_projected_corner_2d = float(loss_w_projected_corner_2d or 0.0)
@@ -725,6 +735,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'use_depth_roi': use_depth_roi,
             'use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT,
             'use_factorized_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT,
+            'factorized_pseudo_weight_min': cfg.MODEL.ROI_CUBE_HEAD.FACTORIZED_PSEUDO_WEIGHT_MIN,
             'use_locate3d_cos_curriculum': cfg.MODEL.ROI_CUBE_HEAD.USE_LOCATE3D_COS_CURRICULUM,
             'locate3d_near_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_NEAR_Z,
             'locate3d_far_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_FAR_Z,
@@ -743,6 +754,7 @@ class ROIHeads3D_Text(StandardROIHeads):
             'depth_consistency_center_crop': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP,
             'depth_consistency_mode': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE,
             'depth_consistency_percentile': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE,
+            'depth_consistency_use_factorized_z_weight': cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_USE_FACTORIZED_Z_WEIGHT,
             'use_projected_corner_depth_aux': cfg.MODEL.ROI_CUBE_HEAD.USE_PROJECTED_CORNER_DEPTH_AUX,
             'loss_w_projected_corner_2d': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_2D,
             'loss_w_projected_corner_depth': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_PROJECTED_CORNER_DEPTH,
@@ -2600,8 +2612,9 @@ class ROIHeads3D_Text(StandardROIHeads):
                 storage.put_scalar(prefix + 'pseudo_weight', gt_pseudo_weight.mean().item(), smoothing_hint=False)
 
             if self.use_factorized_pseudo_weight and gt_factor_weights["dims"].numel() > 0:
+                factor_min = max(float(self.factorized_pseudo_weight_min), 0.0)
                 factor_weights = {
-                    name: values.to(loss_dims.device).clamp(0.05, 1.0)
+                    name: values.to(loss_dims.device).clamp(factor_min, 1.0)
                     for name, values in gt_factor_weights.items()
                 }
                 loss_dims = loss_dims * factor_weights["dims"]
@@ -2854,7 +2867,13 @@ class ROIHeads3D_Text(StandardROIHeads):
                         reduction='none',
                         beta=0.05,
                     )
-                    if gt_pseudo_weight.numel() == cube_z.numel():
+                    if self.depth_consistency_use_factorized_z_weight and gt_factor_weights["z"].numel() == cube_z.numel():
+                        depth_weight = gt_factor_weights["z"].to(cube_z.device)[depth_valid].clamp(
+                            0.0,
+                            1.0,
+                        )
+                        loss_depth_consistency = loss_depth_consistency * depth_weight
+                    elif gt_pseudo_weight.numel() == cube_z.numel():
                         depth_weight = gt_pseudo_weight.to(cube_z.device)[depth_valid].clamp(0.25, 1.0)
                         loss_depth_consistency = loss_depth_consistency * (0.5 + 0.5 * depth_weight)
                     losses.update({

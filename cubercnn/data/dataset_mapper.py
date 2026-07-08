@@ -444,7 +444,7 @@ def annotations_to_instances(annos, image_size, unknown_categories):
             ]
             target.set(
                 f"gt_pseudo_weight_{factor_name}",
-                torch.FloatTensor(factor_weights).clamp(0.05, 1.0),
+                torch.FloatTensor(factor_weights).clamp(0.0, 1.0),
             )
         render_masks = [
             torch.as_tensor(

@@ -78,6 +78,13 @@ def parse_args():
     parser.add_argument("--max_images", type=int, default=None)
     parser.add_argument("--seed", type=int, default=2026)
 
+    parser.add_argument("--min_2d_score", type=float, default=0.0)
+    parser.add_argument("--min_2d_area_ratio", type=float, default=0.0)
+    parser.add_argument("--max_2d_area_ratio", type=float, default=1.0)
+    parser.add_argument("--min_mask_fill_ratio", type=float, default=0.0)
+    parser.add_argument("--max_mask_fill_ratio", type=float, default=2.0)
+    parser.add_argument("--drop_invalid_annotations", action="store_true")
+
     parser.add_argument("--mask_erode_vertical", type=int, default=12)
     parser.add_argument("--mask_erode_vertical_min", type=int, default=2)
     parser.add_argument("--mask_erode_horizontal", type=int, default=6)
@@ -121,6 +128,11 @@ def parse_args():
     parser.add_argument("--mask_selector_min_score_gain", type=float, default=0.03)
     parser.add_argument("--mask_selector_ring_dilate", type=int, default=5)
     parser.add_argument("--mask_selector_store_candidates", action="store_true")
+    parser.add_argument("--use_core_extent_masks", action="store_true")
+    parser.add_argument("--extent_mask_dilate", type=int, default=5)
+    parser.add_argument("--extent_bbox_pad_ratio", type=float, default=0.03)
+    parser.add_argument("--core_center_blend_xy", type=float, default=0.0)
+    parser.add_argument("--core_center_blend_z", type=float, default=0.0)
 
     parser.add_argument("--use_frustum_dbscan", action="store_true")
     parser.add_argument("--dbscan_eps_ratio", type=float, default=0.018)
@@ -173,6 +185,47 @@ def parse_args():
     parser.add_argument("--surface_max_support_drop", type=float, default=0.05)
     parser.add_argument("--surface_include_right_angle_yaws", action="store_true")
     parser.add_argument("--surface_enable_dims_swap", action="store_true")
+    parser.add_argument("--use_geometry_verified_cuboid_optimizer", action="store_true")
+    parser.add_argument("--gvo_yaw_delta_deg", type=float, default=12.0)
+    parser.add_argument("--gvo_scale_delta", type=float, default=0.12)
+    parser.add_argument("--gvo_height_scale_delta", type=float, default=0.08)
+    parser.add_argument("--gvo_xy_blends", default="0.0,0.25")
+    parser.add_argument("--gvo_depth_blends", default="0.0,0.5,1.0")
+    parser.add_argument("--gvo_prior_blends", default="0.0,0.25")
+    parser.add_argument("--gvo_include_prior_dims", action="store_true")
+    parser.add_argument("--gvo_require_improvement", action="store_true", default=True)
+    parser.add_argument("--no_gvo_require_improvement", dest="gvo_require_improvement", action="store_false")
+    parser.add_argument("--gvo_min_loss_gain", type=float, default=0.02)
+    parser.add_argument("--gvo_store_candidates", action="store_true")
+    parser.add_argument(
+        "--use_amodal_cuboid_optimizer",
+        action="store_true",
+        help=(
+            "PCA-free final Step3 estimator. It uses DFU-cleaned mask points "
+            "only as a metric anchor, then searches amodal cuboid candidates "
+            "from prior/visible extent/yaw families with projection-depth "
+            "closed-loop scoring."
+        ),
+    )
+    parser.add_argument("--amodal_yaw_candidates_deg", default="-90,-45,0,45,90")
+    parser.add_argument("--amodal_prior_blends", default="0.35,0.65,1.0")
+    parser.add_argument("--amodal_scale_delta", type=float, default=0.10)
+    parser.add_argument("--amodal_height_scale_delta", type=float, default=0.08)
+    parser.add_argument("--amodal_extent_scale", type=float, default=1.10)
+    parser.add_argument("--amodal_min_visible_extent_ratio", type=float, default=0.80)
+    parser.add_argument("--amodal_xy_blends", default="0.0,0.20")
+    parser.add_argument("--amodal_depth_blends", default="0.5,1.0")
+    parser.add_argument("--amodal_depth_percentile", type=float, default=35.0)
+    parser.add_argument("--amodal_projection_weight", type=float, default=2.4)
+    parser.add_argument("--amodal_silhouette_weight", type=float, default=1.5)
+    parser.add_argument("--amodal_depth_weight", type=float, default=2.2)
+    parser.add_argument("--amodal_support_weight", type=float, default=0.9)
+    parser.add_argument("--amodal_prior_weight", type=float, default=0.75)
+    parser.add_argument("--amodal_ground_weight", type=float, default=0.15)
+    parser.add_argument("--amodal_min_point_support", type=float, default=0.18)
+    parser.add_argument("--amodal_store_candidates", action="store_true")
+    parser.add_argument("--amodal_fallback_to_pca", action="store_true", default=True)
+    parser.add_argument("--no_amodal_fallback_to_pca", dest="amodal_fallback_to_pca", action="store_false")
     parser.add_argument("--use_latent_box_closure", action="store_true")
     parser.add_argument("--latent_topk", type=int, default=8)
     parser.add_argument("--latent_temperature", type=float, default=0.25)
@@ -203,6 +256,14 @@ def parse_args():
     parser.add_argument("--curriculum_dims_floor", type=float, default=0.55)
     parser.add_argument("--curriculum_pose_floor", type=float, default=0.35)
     parser.add_argument("--curriculum_joint_floor", type=float, default=0.45)
+    parser.add_argument("--use_classwise_attribute_weight", action="store_true")
+    parser.add_argument("--classwise_xy_weight_floor", type=float, default=0.0)
+    parser.add_argument("--classwise_z_weight_floor", type=float, default=0.0)
+    parser.add_argument("--thin_dims_weight_cap", type=float, default=0.45)
+    parser.add_argument("--thin_pose_weight_cap", type=float, default=0.25)
+    parser.add_argument("--small_object_area_ratio", type=float, default=0.002)
+    parser.add_argument("--small_dims_weight_cap", type=float, default=0.50)
+    parser.add_argument("--small_pose_weight_cap", type=float, default=0.30)
     parser.add_argument("--use_bev_nms", action="store_true")
     parser.add_argument("--bev_nms_iou_threshold", type=float, default=0.45)
     parser.add_argument("--bev_nms_score_weight", type=float, default=0.50)
@@ -234,6 +295,25 @@ def parse_args():
         "--external_strict_mark_low_valid3d_false",
         action="store_true",
         help="For very weak external boxes, mark valid3D false instead of only down-weighting.",
+    )
+    parser.add_argument(
+        "--use_external_2d_recall_only",
+        action="store_true",
+        help=(
+            "Use external proposals, e.g. Detic, primarily as 2D recall "
+            "positives. Keep valid fitted boxes loadable, but zero their "
+            "3D factorized supervision unless geometry is very strong."
+        ),
+    )
+    parser.add_argument("--external_2d_recall_promote_quality", type=float, default=0.82)
+    parser.add_argument("--external_2d_recall_promote_xy_weight", type=float, default=0.20)
+    parser.add_argument("--external_2d_recall_promote_z_weight", type=float, default=0.20)
+    parser.add_argument("--external_2d_recall_promote_dims_weight", type=float, default=0.0)
+    parser.add_argument("--external_2d_recall_promote_pose_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--external_2d_recall_require_source_anchor",
+        action="store_true",
+        help="Only allow weak center/depth supervision for external boxes matched to a source 3D anchor.",
     )
     parser.add_argument("--stats_json", default=None)
     return parser.parse_args()
@@ -650,6 +730,127 @@ def select_depth_aware_mask(
             for _, _, item in evaluated
         ]
     return selected_mask.astype(np.float32), metrics
+
+
+def bbox_mask_with_padding(
+    bbox: Sequence[float],
+    shape: Tuple[int, int],
+    pad_ratio: float,
+) -> np.ndarray:
+    h, w = int(shape[0]), int(shape[1])
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw = max(x2 - x1 + 1.0, 1.0)
+    bh = max(y2 - y1 + 1.0, 1.0)
+    pad_x = float(pad_ratio) * bw
+    pad_y = float(pad_ratio) * bh
+    x1i = int(np.floor(np.clip(x1 - pad_x, 0, max(w - 1, 0))))
+    x2i = int(np.ceil(np.clip(x2 + pad_x, 0, max(w - 1, 0))))
+    y1i = int(np.floor(np.clip(y1 - pad_y, 0, max(h - 1, 0))))
+    y2i = int(np.ceil(np.clip(y2 + pad_y, 0, max(h - 1, 0))))
+    out = np.zeros((h, w), dtype=bool)
+    if x2i >= x1i and y2i >= y1i:
+        out[y1i : y2i + 1, x1i : x2i + 1] = True
+    return out
+
+
+def build_core_extent_mask(
+    core_mask: np.ndarray,
+    raw_mask: np.ndarray,
+    bbox: Sequence[float],
+    args,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    core_bool = np.asarray(core_mask).squeeze() > 0
+    raw_bool = np.asarray(raw_mask).squeeze() > 0
+    metrics = {
+        "core_extent_enabled": bool(args.use_core_extent_masks),
+        "core_extent_core_pixels": int(core_bool.sum()),
+        "core_extent_raw_pixels": int(raw_bool.sum()),
+        "core_extent_pixels": int(core_bool.sum()),
+        "core_extent_source": "core",
+    }
+    if not bool(args.use_core_extent_masks):
+        return core_bool.astype(np.float32), metrics
+
+    extent = core_bool.copy()
+    dilate = max(0, int(args.extent_mask_dilate))
+    if dilate > 0 and int(core_bool.sum()) > 0:
+        kernel = np.ones((2 * dilate + 1, 2 * dilate + 1), dtype=np.uint8)
+        extent |= cv2.dilate(core_bool.astype(np.uint8), kernel, iterations=1).astype(bool)
+    if int(raw_bool.sum()) > 0:
+        extent |= raw_bool
+
+    bbox_clip = bbox_mask_with_padding(
+        bbox,
+        core_bool.shape,
+        float(args.extent_bbox_pad_ratio),
+    )
+    if int(bbox_clip.sum()) > 0:
+        extent &= bbox_clip
+
+    if int(extent.sum()) < int(core_bool.sum()):
+        extent = core_bool
+        source = "core_fallback"
+    else:
+        source = "raw_or_dilated_core"
+
+    metrics.update(
+        {
+            "core_extent_pixels": int(extent.sum()),
+            "core_extent_source": source,
+            "core_extent_ratio_to_core": float(extent.sum() / max(core_bool.sum(), 1)),
+            "core_extent_ratio_to_raw": float(extent.sum() / max(raw_bool.sum(), 1)),
+        }
+    )
+    return extent.astype(np.float32), metrics
+
+
+def fit_with_core_center(
+    fit,
+    core_points: np.ndarray,
+    args,
+) -> Tuple[object, Dict[str, object]]:
+    metrics = {
+        "core_center_enabled": bool(args.use_core_extent_masks),
+        "core_center_applied": False,
+    }
+    if fit is None or not bool(args.use_core_extent_masks):
+        return fit, metrics
+    points = np.asarray(core_points, dtype=np.float64).reshape(-1, 3)
+    finite = np.all(np.isfinite(points), axis=1) & (points[:, 2] > 0)
+    points = points[finite]
+    if points.shape[0] < int(args.min_points):
+        metrics["core_center_reason"] = "too_few_core_points"
+        return fit, metrics
+
+    vertices, center_cam, dims_omni, R_cam = fit
+    center = np.asarray(center_cam, dtype=np.float64).reshape(3).copy()
+    core_center = np.median(points, axis=0)
+    old_center = center.copy()
+    blend_xy = float(np.clip(args.core_center_blend_xy, 0.0, 1.0))
+    blend_z = float(np.clip(args.core_center_blend_z, 0.0, 1.0))
+    center[:2] = (1.0 - blend_xy) * center[:2] + blend_xy * core_center[:2]
+    center[2] = (1.0 - blend_z) * center[2] + blend_z * core_center[2]
+    if center[2] <= 1e-4 or not np.all(np.isfinite(center)):
+        metrics["core_center_reason"] = "invalid_center"
+        return fit, metrics
+
+    new_vertices = box_vertices_from_pose(center, dims_omni, R_cam)
+    metrics.update(
+        {
+            "core_center_applied": bool(np.linalg.norm(center - old_center) > 1e-6),
+            "core_center_reason": "ok",
+            "core_center_points": int(points.shape[0]),
+            "core_center_xyz": [float(v) for v in core_center.tolist()],
+            "core_center_shift": [float(v) for v in (center - old_center).tolist()],
+            "core_center_shift_norm": float(np.linalg.norm(center - old_center)),
+        }
+    )
+    return (
+        new_vertices.astype(np.float32),
+        center.astype(np.float32),
+        np.asarray(dims_omni, dtype=np.float32),
+        np.asarray(R_cam, dtype=np.float32),
+    ), metrics
 
 
 def estimate_depth_normal(
@@ -1083,6 +1284,29 @@ def clamp_weight(value: float, args) -> float:
     )
 
 
+def parse_float_list(value, default: Sequence[float]) -> List[float]:
+    if value is None:
+        return [float(v) for v in default]
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = str(value).split(",")
+    parsed = []
+    for item in raw_items:
+        try:
+            parsed.append(float(item))
+        except Exception:
+            continue
+    if not parsed:
+        parsed = [float(v) for v in default]
+    # Keep deterministic order while removing exact duplicates.
+    out = []
+    for item in parsed:
+        if not any(abs(item - old) <= 1e-9 for old in out):
+            out.append(float(item))
+    return out
+
+
 def circular_concentration(angles: np.ndarray, weights: np.ndarray) -> float:
     if angles.size == 0:
         return 0.0
@@ -1197,7 +1421,7 @@ def latent_candidate_statistics(candidates: List[dict], args) -> dict:
         "pseudo_weight_joint": weight_joint,
         "pseudo_weight": weight_joint,
     }
-    if args.latent_store_candidates:
+    if args.latent_store_candidates or bool(getattr(args, "gvo_store_candidates", False)):
         result["latent_box_candidates"] = [
             {
                 "loss": float(item["loss"]),
@@ -1226,13 +1450,18 @@ def optimize_box_surface_consistency(
     args,
 ):
     vertices, center_cam, dims_omni, R_cam = fit
+    optimizer_enabled = bool(args.use_surface_box_optimization) or bool(
+        args.use_geometry_verified_cuboid_optimizer
+    )
     metrics = {
         "surface_opt_enabled": bool(args.use_surface_box_optimization),
         "surface_opt_applied": False,
         "surface_opt_candidates": 0,
         "latent_box_enabled": bool(args.use_latent_box_closure),
+        "gvo_enabled": bool(args.use_geometry_verified_cuboid_optimizer),
+        "gvo_applied": False,
     }
-    if not args.use_surface_box_optimization:
+    if not optimizer_enabled:
         return fit, metrics
 
     points = np.asarray(points_cam, dtype=np.float64).reshape(-1, 3)
@@ -1254,16 +1483,29 @@ def optimize_box_surface_consistency(
     max_shift = float(args.surface_max_shift_ratio) * max(float(center_base[2]), 0.25)
     raw_shift = float(np.clip(raw_shift, -max_shift, max_shift))
 
-    delta = max(0.0, float(args.surface_scale_delta))
-    height_delta = max(0.0, float(args.surface_height_scale_delta))
+    if bool(args.use_geometry_verified_cuboid_optimizer):
+        delta = max(float(args.surface_scale_delta), float(args.gvo_scale_delta), 0.0)
+        height_delta = max(
+            float(args.surface_height_scale_delta),
+            float(args.gvo_height_scale_delta),
+            0.0,
+        )
+    else:
+        delta = max(0.0, float(args.surface_scale_delta))
+        height_delta = max(0.0, float(args.surface_height_scale_delta))
     scale_values = sorted(set([max(0.5, 1.0 - delta), 1.0, 1.0 + delta]))
     height_scale_values = sorted(
         set([max(0.5, 1.0 - height_delta), 1.0, 1.0 + height_delta])
     )
-    yaw_delta = math.radians(max(0.0, float(args.surface_yaw_delta_deg)))
+    yaw_delta_deg = float(args.surface_yaw_delta_deg)
+    if bool(args.use_geometry_verified_cuboid_optimizer):
+        yaw_delta_deg = max(yaw_delta_deg, float(args.gvo_yaw_delta_deg))
+    yaw_delta = math.radians(max(0.0, yaw_delta_deg))
     local_yaw_offsets = [-yaw_delta, 0.0, yaw_delta]
     yaw_anchors = [0.0]
-    if bool(args.surface_include_right_angle_yaws):
+    if bool(args.surface_include_right_angle_yaws) or bool(
+        args.use_geometry_verified_cuboid_optimizer
+    ):
         yaw_anchors.extend([-0.5 * math.pi, 0.5 * math.pi])
     yaw_values = sorted(
         set(
@@ -1273,12 +1515,26 @@ def optimize_box_surface_consistency(
         )
     )
     dims_variants = [("base", dims_base.copy())]
-    if bool(args.surface_enable_dims_swap):
+    prior_omni = np.asarray(prior, dtype=np.float64).reshape(3)
+    if bool(args.use_geometry_verified_cuboid_optimizer):
+        for prior_blend in parse_float_list(args.gvo_prior_blends, [0.0, 0.25]):
+            prior_blend = float(np.clip(prior_blend, 0.0, 1.0))
+            if prior_blend <= 1e-9:
+                continue
+            blended = (1.0 - prior_blend) * dims_base + prior_blend * prior_omni
+            if np.all(np.isfinite(blended)) and np.all(blended > 0):
+                dims_variants.append((f"prior_blend_{prior_blend:.2f}", blended.copy()))
+        if bool(args.gvo_include_prior_dims):
+            dims_variants.append(("prior_dims", prior_omni.copy()))
+
+    if bool(args.surface_enable_dims_swap) or bool(args.use_geometry_verified_cuboid_optimizer):
         # Omni3D dimensions are [local-z width, local-y height, local-x length].
         # Swapping local x/z covers the common 90-degree yaw / length-width ambiguity.
-        swapped = dims_base[[2, 1, 0]].copy()
-        if not np.allclose(swapped, dims_base, rtol=1e-4, atol=1e-4):
-            dims_variants.append(("width_length_swap", swapped))
+        base_variants = list(dims_variants)
+        for variant_name, variant_dims in base_variants:
+            swapped = variant_dims[[2, 1, 0]].copy()
+            if not np.allclose(swapped, variant_dims, rtol=1e-4, atol=1e-4):
+                dims_variants.append((f"{variant_name}_width_length_swap", swapped))
     if args.surface_center_mode == "locked":
         depth_blends = [0.0]
         xy_blends = [0.0]
@@ -1288,8 +1544,10 @@ def optimize_box_surface_consistency(
     else:
         depth_blends = [0.0, 0.5, 1.0]
         xy_blends = [0.0, 0.35]
+    if bool(args.use_geometry_verified_cuboid_optimizer):
+        depth_blends = parse_float_list(args.gvo_depth_blends, depth_blends)
+        xy_blends = parse_float_list(args.gvo_xy_blends, xy_blends)
     xy_target = np.median(points[:, :2], axis=0)
-    prior_omni = np.asarray(prior, dtype=np.float64).reshape(3)
     base_bbox_iou, base_silhouette_iou = projected_box_metrics(
         vertices,
         K,
@@ -1363,7 +1621,10 @@ def optimize_box_surface_consistency(
     )
 
     best = base_candidate
-    valid_candidates = [base_candidate] if args.use_latent_box_closure else []
+    collect_candidates = bool(args.use_latent_box_closure) or bool(
+        args.use_geometry_verified_cuboid_optimizer
+    )
+    valid_candidates = [base_candidate] if collect_candidates else []
     metrics["surface_opt_candidates"] = 1
     metrics["surface_opt_yaw_family_count"] = int(len(yaw_values))
     metrics["surface_opt_dims_variant_count"] = int(len(dims_variants))
@@ -1463,17 +1724,19 @@ def optimize_box_surface_consistency(
                                     "yaw_offset": yaw_offset,
                                     "is_base": False,
                                 }
-                                if args.use_latent_box_closure:
+                                if collect_candidates:
                                     valid_candidates.append(candidate)
                                 if best is None or loss < best["loss"]:
                                     best = candidate
 
     chosen = best if best is not None else base_candidate
     gate_reason = "valid"
-    if (
-        bool(args.surface_require_improvement)
-        and not bool(chosen.get("is_base", False))
-    ):
+    require_improvement = bool(args.surface_require_improvement)
+    min_loss_gain = float(args.surface_min_loss_gain)
+    if bool(args.use_geometry_verified_cuboid_optimizer):
+        require_improvement = bool(args.gvo_require_improvement)
+        min_loss_gain = float(args.gvo_min_loss_gain)
+    if require_improvement and not bool(chosen.get("is_base", False)):
         loss_gain = float(base_candidate["loss"] - chosen["loss"])
         bbox_ok = (
             float(chosen["bbox_iou"])
@@ -1488,7 +1751,7 @@ def optimize_box_surface_consistency(
             float(chosen["support"])
             >= float(base_candidate["support"]) - float(args.surface_max_support_drop)
         )
-        gain_ok = loss_gain >= float(args.surface_min_loss_gain)
+        gain_ok = loss_gain >= min_loss_gain
         if not (gain_ok and bbox_ok and depth_ok and support_ok):
             chosen = base_candidate
             gate_reason = "kept_base_by_improvement_gate"
@@ -1518,15 +1781,340 @@ def optimize_box_surface_consistency(
             "surface_opt_scale_dims": [float(v) for v in chosen["scale_dims"]],
             "surface_opt_dims_variant": str(chosen.get("dims_variant", "base")),
             "surface_opt_yaw_offset": float(chosen["yaw_offset"]),
+            "gvo_applied": bool(
+                bool(args.use_geometry_verified_cuboid_optimizer)
+                and not bool(chosen.get("is_base", False))
+            ),
+            "gvo_reason": gate_reason if bool(args.use_geometry_verified_cuboid_optimizer) else "disabled",
+            "gvo_loss": float(chosen["loss"]),
+            "gvo_loss_gain": float(base_candidate["loss"] - chosen["loss"]),
+            "gvo_candidate_count": int(len(valid_candidates)) if collect_candidates else 0,
+            "gvo_chosen_dims_variant": str(chosen.get("dims_variant", "base")),
+            "gvo_chosen_yaw_offset": float(chosen["yaw_offset"]),
         }
     )
-    if args.use_latent_box_closure:
-        metrics.update(latent_candidate_statistics(valid_candidates, args))
+    if collect_candidates:
+        latent_stats = latent_candidate_statistics(valid_candidates, args)
+        if bool(args.use_geometry_verified_cuboid_optimizer):
+            latent_stats["gvo_factorized_weight_enabled"] = True
+            if bool(args.gvo_store_candidates) and "latent_box_candidates" in latent_stats:
+                latent_stats["gvo_candidates"] = latent_stats["latent_box_candidates"]
+        metrics.update(latent_stats)
     return (
         chosen["vertices"].astype(np.float32),
         chosen["center"].astype(np.float32),
         chosen["dims"].astype(np.float32),
         chosen["R"].astype(np.float32),
+    ), metrics
+
+
+def estimate_bbox_amodal_cuboid(
+    points_cam: np.ndarray,
+    prior: Sequence[float],
+    category_name: str,
+    ground_equ: Optional[np.ndarray],
+    gravity_normal: Optional[np.ndarray],
+    K,
+    target_bbox: Sequence[float],
+    target_mask: Optional[np.ndarray],
+    args,
+    rng: np.random.Generator,
+):
+    """PCA-free amodal cuboid search.
+
+    The cleaned mask point cloud anchors metric position/depth, but it does not
+    directly define yaw or final dimensions.  This prevents visible-surface
+    shrinkage on occluded and thin objects, where PCA often overfits the
+    observed fragment.
+    """
+    if points_cam is None or np.asarray(points_cam).shape[0] < 3:
+        return None, {"amodal_reason": "too_few_points", "amodal_enabled": True}
+
+    points = subsample(np.asarray(points_cam, dtype=np.float32), int(args.max_pca_points), rng)
+    if points.shape[0] < 3:
+        return None, {"amodal_reason": "too_few_after_subsample", "amodal_enabled": True}
+
+    w, h, l = [float(v) for v in prior]
+    thin = is_thin_class(category_name)
+
+    normal_source = "identity"
+    if ground_equ is not None and np.all(np.isfinite(ground_equ[:3])):
+        ground_equ = np.asarray(ground_equ, dtype=np.float64).copy()
+        if np.dot(np.array([0.0, -1.0, 0.0]), ground_equ[:3]) <= 0:
+            ground_equ = -ground_equ
+        ground_normal = normalize_vec(ground_equ[:3])
+        rotation_normal = ground_normal
+        normal_source = "ground"
+        if gravity_normal is not None and np.all(np.isfinite(gravity_normal)):
+            depth_normal = normalize_vec(gravity_normal)
+            if np.dot(depth_normal, ground_normal) < 0:
+                depth_normal = -depth_normal
+            blend = float(np.clip(args.normal_fusion_weight, 0.0, 1.0))
+            rotation_normal = normalize_vec((1.0 - blend) * ground_normal + blend * depth_normal)
+            normal_source = "ground_depth_normal_fused"
+        new_ground_equ = np.array(
+            [0.0, -1.0, 0.0, point_to_plane_distance(ground_equ, 0, 0, 0)],
+            dtype=np.float64,
+        )
+        rotation_matrix = rotation_matrix_from_vectors_safe([0.0, -1.0, 0.0], rotation_normal)
+        has_ground = True
+    elif gravity_normal is not None and np.all(np.isfinite(gravity_normal)):
+        rotation_matrix = rotation_matrix_from_vectors_safe(
+            [0.0, -1.0, 0.0],
+            normalize_vec(gravity_normal),
+        )
+        new_ground_equ = None
+        has_ground = False
+        normal_source = "depth_normal"
+    else:
+        rotation_matrix = np.eye(3, dtype=np.float64)
+        new_ground_equ = None
+        has_ground = False
+
+    rotated_pc = points.astype(np.float64) @ rotation_matrix
+    prior_floor, prior_ceil = object_prior_bounds(prior, args)
+    prior_obj = np.asarray([l, h, w], dtype=np.float64)
+    prior_omni = np.asarray(prior, dtype=np.float64)
+    e_low = args.thin_extent_percentile_low if thin else args.extent_percentile_low
+    e_high = args.thin_extent_percentile_high if thin else args.extent_percentile_high
+    e_low, e_high = clamp_percentile_pair(e_low, e_high)
+
+    yaw_values = []
+    for value in parse_float_list(args.amodal_yaw_candidates_deg, [-90.0, -45.0, 0.0, 45.0, 90.0]):
+        yaw_values.append(math.radians(value))
+    yaw_values = sorted(set(float(v) for v in yaw_values))
+
+    prior_blends = [
+        float(np.clip(v, 0.0, 1.0))
+        for v in parse_float_list(args.amodal_prior_blends, [0.35, 0.65, 1.0])
+    ]
+    scale_delta = max(float(args.amodal_scale_delta), 0.0)
+    height_delta = max(float(args.amodal_height_scale_delta), 0.0)
+    scale_values = sorted(set([max(0.5, 1.0 - scale_delta), 1.0, 1.0 + scale_delta]))
+    height_scale_values = sorted(set([max(0.5, 1.0 - height_delta), 1.0, 1.0 + height_delta]))
+    xy_blends = parse_float_list(args.amodal_xy_blends, [0.0, 0.20])
+    depth_blends = parse_float_list(args.amodal_depth_blends, [0.5, 1.0])
+    observed_surface = float(
+        np.percentile(
+            points[:, 2],
+            np.clip(float(args.amodal_depth_percentile), 1.0, 50.0),
+        )
+    )
+    xy_target = np.median(points[:, :2], axis=0)
+
+    best = None
+    valid_candidates: List[dict] = []
+    candidates_evaluated = 0
+    min_visible_ratio = float(np.clip(args.amodal_min_visible_extent_ratio, 0.0, 1.0))
+    extent_scale = max(float(args.amodal_extent_scale), 0.5)
+
+    for yaw in yaw_values:
+        rotated_yaw_pc = (rotate_y(yaw) @ rotated_pc.T).T
+        lows, highs = np.percentile(rotated_yaw_pc, [e_low, e_high], axis=0)
+        x_min, y_min, z_min = lows
+        x_max, y_max, z_max = highs
+        visible = np.asarray(
+            [
+                max(float(x_max - x_min), float(args.min_dimension)),
+                max(float(y_max - y_min), float(args.min_dimension)),
+                max(float(z_max - z_min), float(args.min_dimension)),
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(visible)) or np.any(visible <= 0):
+            continue
+        visible = np.clip(visible * extent_scale, prior_floor, prior_ceil)
+        center_local = np.asarray(
+            [
+                float((x_min + x_max) * 0.5),
+                float((y_min + y_max) * 0.5),
+                float((z_min + z_max) * 0.5),
+            ],
+            dtype=np.float64,
+        )
+
+        dims_seeds = []
+        for blend in prior_blends:
+            dims_seed = (1.0 - blend) * visible + blend * prior_obj
+            dims_seed = np.clip(dims_seed, prior_floor, prior_ceil)
+            dims_seeds.append((f"visible_prior_{blend:.2f}", dims_seed))
+            swapped_prior = np.asarray([w, h, l], dtype=np.float64)
+            swapped_seed = (1.0 - blend) * visible + blend * swapped_prior
+            swapped_seed = np.clip(swapped_seed, prior_floor, prior_ceil)
+            dims_seeds.append((f"visible_prior_swap_{blend:.2f}", swapped_seed))
+
+        for dims_name, dims_seed in dims_seeds:
+            for scale_x in scale_values:
+                for scale_y in height_scale_values:
+                    for scale_z in scale_values:
+                        dims_obj = dims_seed * np.asarray([scale_x, scale_y, scale_z], dtype=np.float64)
+                        dims_obj = np.clip(dims_obj, prior_floor, prior_ceil)
+                        if np.any(dims_obj < visible * min_visible_ratio):
+                            continue
+                        cy = float(center_local[1])
+                        if dims_obj[1] < h * float(args.height_prior_ratio):
+                            dims_obj[1] = float(np.clip(h, prior_floor[1], prior_ceil[1]))
+                        if has_ground and new_ground_equ is not None:
+                            cdis = point_to_plane_distance(
+                                new_ground_equ,
+                                float(center_local[0]),
+                                cy,
+                                float(center_local[2]),
+                            )
+                            if cdis - dims_obj[1] / 2.0 < float(args.ground_snap_distance):
+                                cy += cdis - dims_obj[1] / 2.0
+
+                        vertices_seed, center_seed, dims_omni, R_cam = make_box(
+                            float(center_local[0]),
+                            cy,
+                            float(center_local[2]),
+                            float(dims_obj[0]),
+                            float(dims_obj[1]),
+                            float(dims_obj[2]),
+                            float(yaw),
+                            rotation_matrix,
+                        )
+                        front_seed = float(np.min(vertices_seed[:, 2]))
+                        raw_shift = observed_surface - front_seed
+                        max_shift = float(args.surface_max_shift_ratio) * max(float(center_seed[2]), 0.25)
+                        raw_shift = float(np.clip(raw_shift, -max_shift, max_shift))
+
+                        for depth_blend in depth_blends:
+                            for xy_blend in xy_blends:
+                                center_candidate = np.asarray(center_seed, dtype=np.float64).copy()
+                                center_candidate[:2] += (xy_target - center_candidate[:2]) * float(xy_blend)
+                                center_candidate[2] += raw_shift * float(depth_blend)
+                                vertices_candidate = box_vertices_from_pose(
+                                    center_candidate,
+                                    dims_omni,
+                                    R_cam,
+                                )
+                                if np.any(vertices_candidate[:, 2] <= 1e-4):
+                                    continue
+
+                                bbox_score, silhouette_score = projected_box_metrics(
+                                    vertices_candidate,
+                                    K,
+                                    target_bbox,
+                                    target_mask,
+                                )
+                                front_depth = float(np.min(vertices_candidate[:, 2]))
+                                depth_error = abs(front_depth - observed_surface) / max(observed_surface, 0.10)
+                                support = point_support_3d(
+                                    points,
+                                    center_candidate,
+                                    dims_omni,
+                                    R_cam,
+                                )
+                                if support < float(args.amodal_min_point_support):
+                                    continue
+                                prior_error = float(
+                                    np.mean(
+                                        np.abs(
+                                            np.log(
+                                                np.maximum(dims_omni, 1e-4)
+                                                / np.maximum(prior_omni, 1e-4)
+                                            )
+                                        )
+                                    )
+                                )
+                                ground_error = 0.0
+                                if ground_equ is not None:
+                                    bottom_dist = min(
+                                        point_to_plane_distance(ground_equ, *point)
+                                        for point in vertices_candidate
+                                    )
+                                    ground_error = min(float(bottom_dist), 1.0)
+
+                                loss = (
+                                    float(args.amodal_projection_weight) * (1.0 - bbox_score)
+                                    + float(args.amodal_silhouette_weight) * (1.0 - silhouette_score)
+                                    + float(args.amodal_depth_weight) * min(depth_error, 2.0)
+                                    + float(args.amodal_support_weight) * (1.0 - support)
+                                    + float(args.amodal_prior_weight) * prior_error
+                                    + float(args.amodal_ground_weight) * ground_error
+                                )
+                                candidates_evaluated += 1
+                                candidate = {
+                                    "loss": float(loss),
+                                    "vertices": vertices_candidate,
+                                    "center": center_candidate,
+                                    "dims": dims_omni,
+                                    "R": R_cam,
+                                    "bbox_iou": float(bbox_score),
+                                    "silhouette_iou": float(silhouette_score),
+                                    "depth_error": float(depth_error),
+                                    "support": float(support),
+                                    "prior_error": float(prior_error),
+                                    "front_depth": float(front_depth),
+                                    "depth_blend": float(depth_blend),
+                                    "xy_blend": float(xy_blend),
+                                    "scale_dims": [float(scale_x), float(scale_y), float(scale_z)],
+                                    "dims_variant": dims_name,
+                                    "yaw_offset": float(yaw),
+                                    "is_base": False,
+                                }
+                                valid_candidates.append(candidate)
+                                if best is None or candidate["loss"] < best["loss"]:
+                                    best = candidate
+
+    metrics = {
+        "amodal_enabled": True,
+        "amodal_applied": bool(best is not None),
+        "amodal_reason": "valid" if best is not None else "no_candidate",
+        "amodal_candidates": int(candidates_evaluated),
+        "amodal_yaw_family_count": int(len(yaw_values)),
+        "amodal_fit_rotation_source": normal_source,
+        "amodal_has_ground": bool(has_ground),
+        "amodal_observed_front_depth": float(observed_surface),
+    }
+    if best is None:
+        return None, metrics
+
+    metrics.update(
+        {
+            "fit_reason": "valid",
+            "fit_source": "amodal_cuboid_optimizer",
+            "fit_candidates": int(candidates_evaluated),
+            "fit_loss": float(best["loss"]),
+            "fit_inside_ratio": float(best["support"]),
+            "fit_ray_loss": 0.0,
+            "fit_prior_log_error": float(best["prior_error"]),
+            "fit_yaw": float(best["yaw_offset"]),
+            "fit_has_ground": bool(has_ground),
+            "fit_rotation_source": normal_source,
+            "fit_direct_ok": True,
+            "fit_local_extent_xyz": [
+                float(best["dims"][2]),
+                float(best["dims"][1]),
+                float(best["dims"][0]),
+            ],
+            "amodal_loss": float(best["loss"]),
+            "amodal_bbox_iou": float(best["bbox_iou"]),
+            "amodal_silhouette_iou": float(best["silhouette_iou"]),
+            "amodal_depth_rel_error": float(best["depth_error"]),
+            "amodal_point_support": float(best["support"]),
+            "amodal_prior_log_error": float(best["prior_error"]),
+            "amodal_front_depth": float(best["front_depth"]),
+            "amodal_depth_blend": float(best["depth_blend"]),
+            "amodal_xy_blend": float(best["xy_blend"]),
+            "amodal_scale_dims": [float(v) for v in best["scale_dims"]],
+            "amodal_dims_variant": str(best["dims_variant"]),
+            "amodal_yaw": float(best["yaw_offset"]),
+        }
+    )
+    latent_stats = latent_candidate_statistics(valid_candidates, args)
+    if latent_stats:
+        latent_stats["amodal_factorized_weight_enabled"] = True
+        if bool(args.amodal_store_candidates) and "latent_box_candidates" in latent_stats:
+            latent_stats["amodal_candidates_topk"] = latent_stats["latent_box_candidates"]
+    metrics.update(latent_stats)
+
+    return (
+        best["vertices"].astype(np.float32),
+        best["center"].astype(np.float32),
+        best["dims"].astype(np.float32),
+        best["R"].astype(np.float32),
     ), metrics
 
 
@@ -1724,6 +2312,41 @@ def normalize_bbox_to_pixels(bbox, width: int, height: int) -> List[float]:
         box = np.asarray([box[0] * width, box[1] * height, box[2] * width, box[3] * height])
     x1, y1, x2, y2 = box.tolist()
     return [float(x1), float(y1), float(x2), float(y2)]
+
+
+def proposal_quality_metrics(
+    score: float,
+    bbox: Sequence[float],
+    raw_mask: np.ndarray,
+    width: int,
+    height: int,
+    args,
+) -> Dict[str, object]:
+    bbox_area = bbox_area_pixels(bbox, height, width)
+    image_area = max(float(width * height), 1.0)
+    area_ratio = float(bbox_area / image_area)
+    mask_pixels = int((np.asarray(raw_mask).squeeze() > 0).sum())
+    fill_ratio = float(mask_pixels / max(bbox_area, 1.0))
+    reasons: List[str] = []
+
+    if float(score) < float(args.min_2d_score):
+        reasons.append("low_score")
+    if area_ratio < float(args.min_2d_area_ratio):
+        reasons.append("small_box")
+    if area_ratio > float(args.max_2d_area_ratio):
+        reasons.append("large_box")
+    if fill_ratio < float(args.min_mask_fill_ratio):
+        reasons.append("sparse_mask")
+    if fill_ratio > float(args.max_mask_fill_ratio):
+        reasons.append("oversized_mask")
+
+    return {
+        "proposal_area_ratio": area_ratio,
+        "proposal_mask_pixels": mask_pixels,
+        "proposal_mask_fill_ratio": fill_ratio,
+        "proposal_quality_ok": len(reasons) == 0,
+        "proposal_quality_reason": ",".join(reasons) if reasons else "ok",
+    }
 
 
 def invalid_box_vertices():
@@ -2052,6 +2675,93 @@ def external_strict_3d_update(ann: dict, args, stats=None) -> dict:
     )
     if stats is not None:
         stats[stat_key] += 1
+    return ann
+
+
+def external_2d_recall_update(ann: dict, args, stats=None) -> dict:
+    """Keep external boxes as 2D positives while protecting 3D geometry.
+
+    Detic/external proposals are useful for 2D recall, but their lifted 3D
+    boxes are often noisy. This mode leaves the annotation loadable as a normal
+    foreground 2D instance, then zeros the factorized 3D losses. When geometry
+    evidence is especially strong, it can keep a small center/depth signal while
+    still disabling dimensions and yaw.
+    """
+    if not bool(args.use_external_2d_recall_only):
+        return ann
+    if not is_external_proposal(ann, args):
+        return ann
+
+    ann["external_2d_recall_only"] = True
+    ann["pseudo_label_role"] = "external_2d_recall"
+    if stats is not None:
+        stats["external_2d_recall_seen"] += 1
+
+    if not bool(ann.get("valid3D", True)):
+        ann["pseudo_3d_supervision"] = False
+        ann["external_2d_recall_tier"] = "ignored_invalid_3d"
+        if stats is not None:
+            stats["external_2d_recall_invalid_3d"] += 1
+        return ann
+
+    quality = ann.get("external_strict_quality", None)
+    if quality is None:
+        quality, details = external_strict_quality(ann, args)
+        ann.update(details)
+        ann["external_strict_quality"] = quality
+    quality = float(quality)
+
+    source_anchor_ok = bool(ann.get("source_anchor_found", False)) or bool(
+        ann.get("ng_match_found", False)
+    )
+    can_promote = quality >= float(args.external_2d_recall_promote_quality)
+    if bool(args.external_2d_recall_require_source_anchor):
+        can_promote = can_promote and source_anchor_ok
+
+    if can_promote:
+        ann["pseudo_3d_supervision"] = "center_depth_only"
+        ann["external_2d_recall_tier"] = "center_depth_only"
+        ann["pseudo_weight_xy"] = float(
+            np.clip(
+                min(
+                    finite_float(ann.get("pseudo_weight_xy", 1.0), 1.0),
+                    float(args.external_2d_recall_promote_xy_weight) * quality,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        ann["pseudo_weight_z"] = float(
+            np.clip(
+                min(
+                    finite_float(ann.get("pseudo_weight_z", 1.0), 1.0),
+                    float(args.external_2d_recall_promote_z_weight) * quality,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        ann["pseudo_weight_dims"] = float(
+            max(float(args.external_2d_recall_promote_dims_weight), 0.0)
+        )
+        ann["pseudo_weight_pose"] = float(
+            max(float(args.external_2d_recall_promote_pose_weight), 0.0)
+        )
+        ann["pseudo_weight_joint"] = 0.0
+        ann["pseudo_weight"] = 0.0
+        if stats is not None:
+            stats["external_2d_recall_center_depth"] += 1
+    else:
+        ann["pseudo_3d_supervision"] = False
+        ann["external_2d_recall_tier"] = "2d_only"
+        ann["pseudo_weight_xy"] = 0.0
+        ann["pseudo_weight_z"] = 0.0
+        ann["pseudo_weight_dims"] = 0.0
+        ann["pseudo_weight_pose"] = 0.0
+        ann["pseudo_weight_joint"] = 0.0
+        ann["pseudo_weight"] = 0.0
+        if stats is not None:
+            stats["external_2d_recall_2d_only"] += 1
     return ann
 
 
@@ -2547,6 +3257,63 @@ def locate3d_factorized_curriculum_update(ann: dict, args) -> dict:
     return ann
 
 
+def classwise_attribute_weight_update(ann: dict, args) -> dict:
+    if not bool(args.use_classwise_attribute_weight):
+        return ann
+    if not bool(ann.get("valid3D", True)):
+        return ann
+
+    category_name = str(ann.get("category_name", "")).lower().strip()
+    area_ratio = float(ann.get("proposal_area_ratio", 1.0))
+    base = float(ann.get("pseudo_weight", 1.0))
+    xy = float(ann.get("pseudo_weight_xy", base))
+    z = float(ann.get("pseudo_weight_z", base))
+    dims = float(ann.get("pseudo_weight_dims", base))
+    pose = float(ann.get("pseudo_weight_pose", base))
+    reasons: List[str] = []
+
+    xy_floor = float(args.classwise_xy_weight_floor)
+    z_floor = float(args.classwise_z_weight_floor)
+    old_xy, old_z = xy, z
+    xy = max(xy, xy_floor)
+    z = max(z, z_floor)
+    if xy > old_xy + 1e-6 or z > old_z + 1e-6:
+        reasons.append("center_depth_floor")
+    if is_thin_class(category_name):
+        dims = min(dims, float(args.thin_dims_weight_cap))
+        pose = min(pose, float(args.thin_pose_weight_cap))
+        reasons.append("thin_or_planar")
+    if area_ratio < float(args.small_object_area_ratio):
+        dims = min(dims, float(args.small_dims_weight_cap))
+        pose = min(pose, float(args.small_pose_weight_cap))
+        reasons.append("small_2d")
+
+    if not reasons:
+        ann["classwise_attribute_weight"] = False
+        return ann
+
+    xy = float(np.clip(xy, float(args.min_weight), 1.0))
+    z = float(np.clip(z, float(args.min_weight), 1.0))
+    dims = float(np.clip(dims, float(args.min_weight), 1.0))
+    pose = float(np.clip(pose, float(args.min_weight), 1.0))
+    joint = float(np.exp(np.mean(np.log(np.maximum([xy, z, dims, pose], 1e-4)))))
+    joint = float(np.clip(joint, float(args.min_weight), 1.0))
+
+    ann.update(
+        {
+            "classwise_attribute_weight": True,
+            "classwise_attribute_weight_reason": ",".join(reasons),
+            "pseudo_weight_xy": xy,
+            "pseudo_weight_z": z,
+            "pseudo_weight_dims": dims,
+            "pseudo_weight_pose": pose,
+            "pseudo_weight_joint": joint,
+            "pseudo_weight": joint,
+        }
+    )
+    return ann
+
+
 def ann_bev_box(ann: dict) -> Optional[np.ndarray]:
     if not bool(ann.get("valid3D", True)):
         return None
@@ -2725,6 +3492,22 @@ def main():
                 "proposal_source_index": int(proposal_source_index),
                 "proposal_2d_score": float(score),
             }
+            proposal_quality = proposal_quality_metrics(
+                score,
+                bbox,
+                raw_mask[j],
+                width,
+                height,
+                args,
+            )
+            extra.update(proposal_quality)
+            if not bool(proposal_quality.get("proposal_quality_ok", True)):
+                stats["skipped_2d_quality"] += 1
+                for reason in str(proposal_quality.get("proposal_quality_reason", "")).split(","):
+                    if reason:
+                        stats[f"skipped_2d_{reason}"] += 1
+                continue
+
             source_anchor, source_anchor_iou = match_source_anchor(
                 source_anchor_index,
                 used_anchor_ids,
@@ -2765,6 +3548,10 @@ def main():
             extra["dfu_mask_source"] = mask_source
             if np.asarray(cur_mask).sum() < int(args.min_mask_pixels):
                 stats["invalid_small_mask"] += 1
+                if bool(args.drop_invalid_annotations):
+                    stats["dropped_invalid_annotations"] += 1
+                    stats["dropped_invalid_small_mask"] += 1
+                    continue
                 ann = build_invalid_annotation(
                     ann_id,
                     dataset_id,
@@ -2782,6 +3569,7 @@ def main():
                 ann = reference_match_update(ann, ref_index, args)
                 ann = imov3d_quality_weight_update(ann, args)
                 ann = external_strict_3d_update(ann, args, stats)
+                ann = external_2d_recall_update(ann, args, stats)
                 annotations.append(ann)
                 ann_id += 1
                 continue
@@ -2789,19 +3577,23 @@ def main():
             clean_mask, edge_metrics = remove_depth_edges(depth, cur_mask, args)
             extra.update(edge_metrics)
             extra.update(gravity_metrics)
-            raw_points = mask_to_points(depth, clean_mask, K)
-            clustered_points, cluster_metrics = select_frustum_cluster(
-                raw_points,
+            core_points_raw = mask_to_points(depth, clean_mask, K)
+            core_clustered_points, cluster_metrics = select_frustum_cluster(
+                core_points_raw,
                 clean_mask,
                 K,
                 args,
                 rng,
             )
             extra.update(cluster_metrics)
-            filtered_points, dfu_metrics = dfu_filter_points(clustered_points, category_name, args)
+            core_filtered_points, dfu_metrics = dfu_filter_points(core_clustered_points, category_name, args)
             extra.update(dfu_metrics)
-            if filtered_points is None:
+            if core_filtered_points is None:
                 stats["invalid_no_points"] += 1
+                if bool(args.drop_invalid_annotations):
+                    stats["dropped_invalid_annotations"] += 1
+                    stats["dropped_invalid_no_points"] += 1
+                    continue
                 ann = build_invalid_annotation(
                     ann_id,
                     dataset_id,
@@ -2815,24 +3607,89 @@ def main():
                 ann = reference_match_update(ann, ref_index, args)
                 ann = imov3d_quality_weight_update(ann, args)
                 ann = external_strict_3d_update(ann, args, stats)
+                ann = external_2d_recall_update(ann, args, stats)
                 annotations.append(ann)
                 ann_id += 1
                 continue
+
+            extent_mask, extent_metrics = build_core_extent_mask(
+                clean_mask,
+                raw_mask[j],
+                bbox,
+                args,
+            )
+            extra.update(extent_metrics)
+            fit_points = core_filtered_points
+            fit_mask = clean_mask
+            if bool(args.use_core_extent_masks):
+                extent_raw_points = mask_to_points(depth, extent_mask, K)
+                extent_clustered_points, extent_cluster_metrics = select_frustum_cluster(
+                    extent_raw_points,
+                    extent_mask,
+                    K,
+                    args,
+                    rng,
+                )
+                extra.update({f"extent_{k}": v for k, v in extent_cluster_metrics.items()})
+                extent_filtered_points, extent_dfu_metrics = dfu_filter_points(
+                    extent_clustered_points,
+                    category_name,
+                    args,
+                )
+                extra.update({f"extent_{k}": v for k, v in extent_dfu_metrics.items()})
+                if extent_filtered_points is not None:
+                    fit_points = extent_filtered_points
+                    fit_mask = extent_mask
+                    stats["core_extent_fit_used"] += 1
+                else:
+                    stats["core_extent_fit_fallback_to_core"] += 1
 
             prior = SUNRGBD.get(category_name)
             if prior is None:
                 stats["unknown_prior"] += 1
                 prior = [0.5, 0.5, 0.5]
 
-            fit, fit_metrics = estimate_bbox_dfu_robust(
-                filtered_points,
-                prior,
-                category_name,
-                ground_equ if has_ground else None,
-                gravity_normal,
-                args,
-                rng,
-            )
+            if bool(args.use_amodal_cuboid_optimizer):
+                fit, fit_metrics = estimate_bbox_amodal_cuboid(
+                    fit_points,
+                    prior,
+                    category_name,
+                    ground_equ if has_ground else None,
+                    gravity_normal,
+                    K,
+                    bbox,
+                    fit_mask,
+                    args,
+                    rng,
+                )
+                if fit is None and bool(args.amodal_fallback_to_pca):
+                    pca_fit, pca_metrics = estimate_bbox_dfu_robust(
+                        fit_points,
+                        prior,
+                        category_name,
+                        ground_equ if has_ground else None,
+                        gravity_normal,
+                        args,
+                        rng,
+                    )
+                    fit = pca_fit
+                    pca_metrics = {f"fallback_pca_{k}": v for k, v in pca_metrics.items()}
+                    fit_metrics.update(pca_metrics)
+                    fit_metrics["fit_reason"] = "valid" if fit is not None else "amodal_and_fallback_failed"
+                    fit_metrics["fit_source"] = "fallback_dfu_robust_pca"
+                    fit_metrics["amodal_fallback_to_pca_used"] = bool(fit is not None)
+                else:
+                    fit_metrics["amodal_fallback_to_pca_used"] = False
+            else:
+                fit, fit_metrics = estimate_bbox_dfu_robust(
+                    fit_points,
+                    prior,
+                    category_name,
+                    ground_equ if has_ground else None,
+                    gravity_normal,
+                    args,
+                    rng,
+                )
             extra.update(fit_metrics)
             extra["dfu_has_ground"] = bool(has_ground)
             extra["dfu_prior_whl"] = [float(x) for x in prior]
@@ -2841,11 +3698,26 @@ def main():
                 extra["fit_source_before_surface"] = "source_geometry_anchor"
                 stats["source_anchor_used"] += 1
             else:
-                extra["fit_source_before_surface"] = "dfu_robust_pca"
+                extra["fit_source_before_surface"] = (
+                    "amodal_cuboid_optimizer"
+                    if bool(args.use_amodal_cuboid_optimizer)
+                    and str(extra.get("fit_source", "")).startswith("amodal")
+                    else "dfu_robust_pca"
+                )
                 stats["source_anchor_missing"] += 1
+                fit, core_center_metrics = fit_with_core_center(
+                    fit,
+                    core_filtered_points,
+                    args,
+                )
+                extra.update(core_center_metrics)
 
             if fit is None:
                 stats["invalid_fit_failed"] += 1
+                if bool(args.drop_invalid_annotations):
+                    stats["dropped_invalid_annotations"] += 1
+                    stats["dropped_invalid_fit_failed"] += 1
+                    continue
                 ann = build_invalid_annotation(
                     ann_id,
                     dataset_id,
@@ -2859,11 +3731,11 @@ def main():
             else:
                 fit, surface_metrics = optimize_box_surface_consistency(
                     fit,
-                    filtered_points,
+                    fit_points,
                     prior,
                     K,
                     bbox,
-                    clean_mask,
+                    fit_mask,
                     ground_equ if has_ground else None,
                     args,
                 )
@@ -2911,12 +3783,14 @@ def main():
                     clean_mask,
                     bbox,
                     K,
-                    filtered_points,
+                    core_filtered_points,
                     prior,
                     args,
                 )
                 ann = locate3d_factorized_curriculum_update(ann, args)
+                ann = classwise_attribute_weight_update(ann, args)
             ann = external_strict_3d_update(ann, args, stats)
+            ann = external_2d_recall_update(ann, args, stats)
             if bool(ann.get("valid3D", True)):
                 if bool(ann.get("dbscan_enabled", False)):
                     stats["dfu3d_cluster_cleaning_seen"] += 1
@@ -2928,6 +3802,22 @@ def main():
                     stats["imov3d_quality_weighted"] += 1
                 if bool(ann.get("moca3d_projected_corner_depth_enabled", False)):
                     stats["moca3d_corner_depth_scored"] += 1
+                if bool(ann.get("core_extent_enabled", False)):
+                    stats["core_extent_seen"] += 1
+                    if bool(ann.get("core_center_applied", False)):
+                        stats["core_center_applied"] += 1
+                if bool(ann.get("classwise_attribute_weight", False)):
+                    stats["classwise_attribute_weighted"] += 1
+                if bool(ann.get("gvo_enabled", False)):
+                    stats["gvo_seen"] += 1
+                    if bool(ann.get("gvo_applied", False)):
+                        stats["gvo_applied"] += 1
+                if bool(ann.get("amodal_enabled", False)):
+                    stats["amodal_seen"] += 1
+                    if bool(ann.get("amodal_applied", False)):
+                        stats["amodal_applied"] += 1
+                    if bool(ann.get("amodal_fallback_to_pca_used", False)):
+                        stats["amodal_fallback_to_pca_used"] += 1
             if bool(ann.get("valid3D", True)):
                 weight_values.append(float(ann.get("pseudo_weight", 1.0)))
                 if "pag_score" in ann:
@@ -2954,20 +3844,29 @@ def main():
         "annotations": annotations,
     }
     output.setdefault("info", {})
-    output["info"]["pseudo_label_method"] = (
-        "imov3d_depth_edge_dbscan_normal_surface_optimization"
-        if (
-            args.use_depth_edge_filter
-            or args.use_depth_aware_mask_selector
-            or args.use_frustum_dbscan
-            or args.use_normal_ground_fusion
-            or args.use_surface_box_optimization
-        )
-        else "dfu_robust_pca_with_boxer_consistency_weight"
-    )
+    if args.use_amodal_cuboid_optimizer:
+        method_name = "pca_free_amodal_cuboid_optimizer"
+    elif args.use_geometry_verified_cuboid_optimizer:
+        method_name = "geometry_verified_cuboid_optimizer_step3"
+    elif (
+        args.use_depth_edge_filter
+        or args.use_depth_aware_mask_selector
+        or args.use_frustum_dbscan
+        or args.use_normal_ground_fusion
+        or args.use_surface_box_optimization
+    ):
+        method_name = "imov3d_depth_edge_dbscan_normal_surface_optimization"
+    else:
+        method_name = "dfu_robust_pca_with_boxer_consistency_weight"
+    output["info"]["pseudo_label_method"] = method_name
     output["info"]["pseudo_label_source_json"] = os.path.abspath(args.source_json)
     output["info"]["pseudo_label_cache_root"] = os.path.abspath(input_folder)
     output["info"]["depth_aware_mask_selector"] = bool(args.use_depth_aware_mask_selector)
+    output["info"]["drop_invalid_annotations"] = bool(args.drop_invalid_annotations)
+    output["info"]["core_extent_masks"] = bool(args.use_core_extent_masks)
+    output["info"]["extent_mask_dilate"] = int(args.extent_mask_dilate)
+    output["info"]["core_center_blend_xy"] = float(args.core_center_blend_xy)
+    output["info"]["core_center_blend_z"] = float(args.core_center_blend_z)
     output["info"]["imov3d_depth_edge_filter"] = bool(args.use_depth_edge_filter)
     output["info"]["imov3d_frustum_dbscan"] = bool(args.use_frustum_dbscan)
     output["info"]["imov3d_normal_ground_fusion"] = bool(args.use_normal_ground_fusion)
@@ -2976,9 +3875,32 @@ def main():
     output["info"]["moca3d_projected_corner_depth_score"] = bool(args.use_projected_corner_depth_score)
     output["info"]["pag_apply_to_weight"] = bool(args.pag_apply_to_weight)
     output["info"]["locate3d_factorized_curriculum"] = bool(args.use_locate3d_factorized_curriculum)
+    output["info"]["classwise_attribute_weight"] = bool(args.use_classwise_attribute_weight)
     output["info"]["surface_box_optimization"] = bool(args.use_surface_box_optimization)
     output["info"]["surface_include_right_angle_yaws"] = bool(args.surface_include_right_angle_yaws)
     output["info"]["surface_enable_dims_swap"] = bool(args.surface_enable_dims_swap)
+    output["info"]["geometry_verified_cuboid_optimizer"] = bool(
+        args.use_geometry_verified_cuboid_optimizer
+    )
+    output["info"]["amodal_cuboid_optimizer"] = bool(args.use_amodal_cuboid_optimizer)
+    output["info"]["amodal_fallback_to_pca"] = bool(args.amodal_fallback_to_pca)
+    output["info"]["amodal_yaw_candidates_deg"] = str(args.amodal_yaw_candidates_deg)
+    output["info"]["amodal_prior_blends"] = str(args.amodal_prior_blends)
+    output["info"]["amodal_extent_scale"] = float(args.amodal_extent_scale)
+    output["info"]["amodal_min_visible_extent_ratio"] = float(args.amodal_min_visible_extent_ratio)
+    output["info"]["amodal_projection_weight"] = float(args.amodal_projection_weight)
+    output["info"]["amodal_silhouette_weight"] = float(args.amodal_silhouette_weight)
+    output["info"]["amodal_depth_weight"] = float(args.amodal_depth_weight)
+    output["info"]["amodal_support_weight"] = float(args.amodal_support_weight)
+    output["info"]["amodal_prior_weight"] = float(args.amodal_prior_weight)
+    output["info"]["gvo_require_improvement"] = bool(args.gvo_require_improvement)
+    output["info"]["gvo_min_loss_gain"] = float(args.gvo_min_loss_gain)
+    output["info"]["gvo_yaw_delta_deg"] = float(args.gvo_yaw_delta_deg)
+    output["info"]["gvo_scale_delta"] = float(args.gvo_scale_delta)
+    output["info"]["gvo_height_scale_delta"] = float(args.gvo_height_scale_delta)
+    output["info"]["gvo_xy_blends"] = str(args.gvo_xy_blends)
+    output["info"]["gvo_depth_blends"] = str(args.gvo_depth_blends)
+    output["info"]["gvo_prior_blends"] = str(args.gvo_prior_blends)
     output["info"]["source_geometry_anchor"] = bool(args.use_source_geometry_anchor)
     output["info"]["surface_center_mode"] = str(args.surface_center_mode)
     output["info"]["surface_require_improvement"] = bool(args.surface_require_improvement)
@@ -2993,6 +3915,25 @@ def main():
         output["info"]["ng_mean_pseudo_weight"] = float(np.mean(weight_values))
     if pag_values:
         output["info"]["pag_mean_score"] = float(np.mean(pag_values))
+    output["info"]["external_2d_recall_only"] = bool(args.use_external_2d_recall_only)
+    output["info"]["external_2d_recall_promote_quality"] = float(
+        args.external_2d_recall_promote_quality
+    )
+    effective3d = [
+        ann
+        for ann in annotations
+        if bool(ann.get("valid3D", True))
+        and ann.get("pseudo_3d_supervision", True) is not False
+        and max(
+            finite_float(ann.get("pseudo_weight_xy", ann.get("pseudo_weight", 1.0)), 0.0),
+            finite_float(ann.get("pseudo_weight_z", ann.get("pseudo_weight", 1.0)), 0.0),
+            finite_float(ann.get("pseudo_weight_dims", ann.get("pseudo_weight", 1.0)), 0.0),
+            finite_float(ann.get("pseudo_weight_pose", ann.get("pseudo_weight", 1.0)), 0.0),
+            finite_float(ann.get("pseudo_weight_joint", ann.get("pseudo_weight", 1.0)), 0.0),
+        )
+        > 0.0
+    ]
+    output["info"]["effective3D_annotations"] = len(effective3d)
 
     os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
     with open(args.output_json, "w") as f:
@@ -3002,6 +3943,7 @@ def main():
     stats["annotations"] = len(annotations)
     stats["valid3d"] = int(sum(1 for a in annotations if bool(a.get("valid3D", True))))
     stats["invalid3d"] = int(len(annotations) - stats["valid3d"])
+    stats["effective3d"] = int(len(effective3d))
     if weight_values:
         stats["pseudo_weight_mean_x1000"] = int(round(float(np.mean(weight_values)) * 1000))
         stats["pseudo_weight_p10_x1000"] = int(round(float(np.percentile(weight_values, 10)) * 1000))

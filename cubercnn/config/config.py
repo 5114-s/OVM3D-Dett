@@ -121,6 +121,7 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT = False
     cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT = False
+    cfg.MODEL.ROI_CUBE_HEAD.FACTORIZED_PSEUDO_WEIGHT_MIN = 0.05
 
     # LocateAnything3D-style lightweight Chain-of-Sight curriculum. This is a
     # training-only pseudo-label reweighting layer: first estimate whether the
@@ -214,6 +215,7 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_CENTER_CROP = 0.75
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_MODE = "center"
     cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_PERCENTILE = 0.35
+    cfg.MODEL.ROI_CUBE_HEAD.DEPTH_CONSISTENCY_USE_FACTORIZED_Z_WEIGHT = False
 
     # MoCA3D-inspired projected corner-depth auxiliary supervision. The main
     # CubeHead still predicts the standard 3D box; this loss only asks the
