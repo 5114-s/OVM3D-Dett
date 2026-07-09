@@ -438,6 +438,28 @@ def parse_args():
     parser.add_argument("--openbox_context_min_area_ratio", type=float, default=0.0)
     parser.add_argument("--openbox_context_max_area_ratio", type=float, default=1.0)
     parser.add_argument(
+        "--use_openbox_bidirectional_cluster_refine",
+        action="store_true",
+        help=(
+            "OpenBox-style instance cluster refinement only.  Cluster local "
+            "bbox/frustum UniDepth points, compare each cluster with the "
+            "eroded instance point cloud by bidirectional proximity ratios, "
+            "and feed only accepted clusters to the original PCA estimator."
+        ),
+    )
+    parser.add_argument("--openbox_bidir_bbox_pad_ratio", type=float, default=0.03)
+    parser.add_argument("--openbox_bidir_context_dilate", type=int, default=2)
+    parser.add_argument("--openbox_bidir_eps_ratio", type=float, default=0.018)
+    parser.add_argument("--openbox_bidir_eps_min", type=float, default=0.035)
+    parser.add_argument("--openbox_bidir_min_cluster_points", type=int, default=12)
+    parser.add_argument("--openbox_bidir_max_points", type=int, default=3500)
+    parser.add_argument("--openbox_bidir_delta_ratio", type=float, default=1.50)
+    parser.add_argument("--openbox_bidir_delta_min", type=float, default=0.055)
+    parser.add_argument("--openbox_bidir_alpha", type=float, default=0.42)
+    parser.add_argument("--openbox_bidir_beta", type=float, default=0.35)
+    parser.add_argument("--openbox_bidir_min_keep_ratio", type=float, default=0.18)
+    parser.add_argument("--openbox_bidir_max_expand_ratio", type=float, default=2.0)
+    parser.add_argument(
         "--use_physical_type_adaptive_box",
         action="store_true",
         help=(
@@ -1170,6 +1192,178 @@ def select_frustum_cluster(
             "dbscan_selected_score": float(best["score"]),
             "dbscan_selected_id": int(best["id"]),
             "dbscan_reason": "ok",
+        }
+    )
+    return selected.astype(np.float32), metrics
+
+
+def openbox_bidirectional_cluster_refine_points(
+    depth: np.ndarray,
+    clean_mask: np.ndarray,
+    raw_mask: np.ndarray,
+    bbox: Sequence[float],
+    K,
+    instance_points: np.ndarray,
+    args,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """OpenBox-style bidirectional cluster assignment for single-view pseudo points.
+
+    OpenBox uses LiDAR clusters and retains a cluster R_k for instance F_i only
+    when both R_k -> F_i and F_i -> R_k proximity ratios are high.  Here the
+    local raw point cloud is built from UniDepth in the 2D bbox/mask context,
+    while F_i is the eroded-mask instance cloud.  The module only changes the
+    point set sent to PCA; all downstream PCA/raytrace/prior/ground logic stays
+    untouched.
+    """
+    points_core = np.asarray(instance_points, dtype=np.float32).reshape(-1, 3)
+    metrics: Dict[str, object] = {
+        "openbox_bidir_enabled": bool(args.use_openbox_bidirectional_cluster_refine),
+        "openbox_bidir_applied": False,
+        "openbox_bidir_input_points": int(points_core.shape[0]),
+        "openbox_bidir_output_points": int(points_core.shape[0]),
+    }
+    if not bool(args.use_openbox_bidirectional_cluster_refine):
+        return points_core, metrics
+    if points_core.shape[0] < int(args.min_points):
+        metrics["openbox_bidir_reason"] = "too_few_instance_points"
+        return points_core, metrics
+
+    clean_bool = np.asarray(clean_mask).squeeze() > 0
+    raw_bool = np.asarray(raw_mask).squeeze() > 0
+    h, w = clean_bool.shape[:2]
+    bbox_bool = bbox_mask_with_padding(
+        bbox,
+        (h, w),
+        float(args.openbox_bidir_bbox_pad_ratio),
+    )
+    context_mask = binary_dilate(
+        raw_bool | clean_bool,
+        int(args.openbox_bidir_context_dilate),
+    )
+    context_mask = (context_mask | clean_bool) & bbox_bool
+    context_points = mask_to_points(depth, context_mask, K)
+    metrics["openbox_bidir_context_pixels"] = int(context_mask.sum())
+    metrics["openbox_bidir_candidate_points"] = int(context_points.shape[0])
+    if context_points.shape[0] < int(args.openbox_bidir_min_cluster_points):
+        metrics["openbox_bidir_reason"] = "too_few_context_points"
+        return points_core, metrics
+
+    finite = np.all(np.isfinite(context_points), axis=1) & (context_points[:, 2] > 0.05)
+    context_points = context_points[finite].astype(np.float32)
+    if context_points.shape[0] < int(args.openbox_bidir_min_cluster_points):
+        metrics["openbox_bidir_reason"] = "too_few_finite_context_points"
+        return points_core, metrics
+
+    max_points = max(int(args.openbox_bidir_max_points), int(args.openbox_bidir_min_cluster_points))
+    fit_points = context_points
+    if fit_points.shape[0] > max_points:
+        fit_idx = rng.choice(fit_points.shape[0], size=max_points, replace=False)
+        fit_points = fit_points[fit_idx]
+
+    try:
+        from sklearn.cluster import DBSCAN
+        from scipy.spatial import cKDTree
+    except Exception as exc:
+        metrics.update(
+            {
+                "openbox_bidir_fallback": True,
+                "openbox_bidir_reason": f"unavailable:{str(exc)[:80]}",
+            }
+        )
+        return points_core, metrics
+
+    median_z = float(np.median(fit_points[:, 2]))
+    eps = max(float(args.openbox_bidir_eps_min), float(args.openbox_bidir_eps_ratio) * max(median_z, 0.25))
+    delta = max(float(args.openbox_bidir_delta_min), float(args.openbox_bidir_delta_ratio) * eps)
+    labels = DBSCAN(eps=eps, min_samples=max(2, int(args.dbscan_min_samples))).fit_predict(fit_points)
+    cluster_ids = [int(v) for v in np.unique(labels) if int(v) >= 0]
+    metrics.update(
+        {
+            "openbox_bidir_eps": float(eps),
+            "openbox_bidir_delta": float(delta),
+            "openbox_bidir_clusters": int(len(cluster_ids)),
+        }
+    )
+    if not cluster_ids:
+        metrics["openbox_bidir_reason"] = "no_cluster"
+        return points_core, metrics
+
+    core_tree = cKDTree(points_core.astype(np.float32))
+    accepted: List[np.ndarray] = []
+    candidate_summaries: List[Dict[str, object]] = []
+    best_score = -1.0
+    best_cluster = None
+    for cluster_id in cluster_ids:
+        cluster = fit_points[labels == cluster_id]
+        if cluster.shape[0] < int(args.openbox_bidir_min_cluster_points):
+            continue
+        cluster_tree = cKDTree(cluster.astype(np.float32))
+        c_to_i_dist, _ = core_tree.query(cluster, k=1)
+        i_to_c_dist, _ = cluster_tree.query(points_core, k=1)
+        cluster_to_instance = float(np.mean(c_to_i_dist < delta))
+        instance_to_cluster = float(np.mean(i_to_c_dist < delta))
+        size_ratio = float(cluster.shape[0] / max(fit_points.shape[0], 1))
+        score = 0.45 * cluster_to_instance + 0.45 * instance_to_cluster + 0.10 * min(size_ratio * 4.0, 1.0)
+        item = {
+            "id": int(cluster_id),
+            "points": int(cluster.shape[0]),
+            "cluster_to_instance": cluster_to_instance,
+            "instance_to_cluster": instance_to_cluster,
+            "size_ratio": size_ratio,
+            "score": float(score),
+        }
+        candidate_summaries.append(item)
+        if score > best_score:
+            best_score = score
+            best_cluster = cluster
+        if (
+            cluster_to_instance >= float(args.openbox_bidir_alpha)
+            and instance_to_cluster >= float(args.openbox_bidir_beta)
+        ):
+            accepted.append(cluster)
+
+    if not accepted:
+        if best_cluster is not None:
+            metrics["openbox_bidir_best_score"] = float(best_score)
+        metrics["openbox_bidir_reason"] = "no_bidirectional_match"
+        metrics["openbox_bidir_candidate_summaries"] = candidate_summaries[:8]
+        return points_core, metrics
+
+    selected = np.concatenate(accepted, axis=0).astype(np.float32)
+    _, unique_indices = np.unique(np.round(selected, decimals=4), axis=0, return_index=True)
+    selected = selected[np.sort(unique_indices)]
+    keep_ratio = float(selected.shape[0] / max(points_core.shape[0], 1))
+    if (
+        selected.shape[0] < int(args.min_points)
+        or keep_ratio < float(args.openbox_bidir_min_keep_ratio)
+    ):
+        metrics.update(
+            {
+                "openbox_bidir_reason": "selected_too_small",
+                "openbox_bidir_selected_points": int(selected.shape[0]),
+                "openbox_bidir_keep_ratio": keep_ratio,
+                "openbox_bidir_candidate_summaries": candidate_summaries[:8],
+            }
+        )
+        return points_core, metrics
+
+    max_expand = max(1.0, float(args.openbox_bidir_max_expand_ratio))
+    if selected.shape[0] > int(points_core.shape[0] * max_expand):
+        core_center = np.median(points_core, axis=0)
+        order = np.argsort(np.linalg.norm(selected - core_center.reshape(1, 3), axis=1))
+        selected = selected[order[: int(points_core.shape[0] * max_expand)]]
+        metrics["openbox_bidir_capped_expand"] = True
+
+    metrics.update(
+        {
+            "openbox_bidir_applied": True,
+            "openbox_bidir_reason": "ok",
+            "openbox_bidir_output_points": int(selected.shape[0]),
+            "openbox_bidir_selected_clusters": int(len(accepted)),
+            "openbox_bidir_keep_ratio": float(selected.shape[0] / max(points_core.shape[0], 1)),
+            "openbox_bidir_best_score": float(best_score),
+            "openbox_bidir_candidate_summaries": candidate_summaries[:8],
         }
     )
     return selected.astype(np.float32), metrics
@@ -4872,6 +5066,17 @@ def main():
                     "openbox_context_external": bool(context_external),
                 }
             extra.update(context_metrics)
+            core_points_raw, bidir_metrics = openbox_bidirectional_cluster_refine_points(
+                depth,
+                clean_mask,
+                raw_mask[j],
+                bbox,
+                K,
+                core_points_raw,
+                args,
+                rng,
+            )
+            extra.update(bidir_metrics)
             core_clustered_points, cluster_metrics = select_frustum_cluster(
                 core_points_raw,
                 clean_mask,
@@ -5196,6 +5401,10 @@ def main():
                     stats["openbox_context_seen"] += 1
                     if bool(ann.get("openbox_context_applied", False)):
                         stats["openbox_context_applied"] += 1
+                if bool(ann.get("openbox_bidir_enabled", False)):
+                    stats["openbox_bidir_seen"] += 1
+                    if bool(ann.get("openbox_bidir_applied", False)):
+                        stats["openbox_bidir_applied"] += 1
                 if bool(ann.get("physical_type_adaptive_box", False)):
                     stats["physical_type_adaptive_box_seen"] += 1
                 if bool(ann.get("openbox_adaptive_completion", False)):
@@ -5245,6 +5454,8 @@ def main():
         method_name = "pca_free_amodal_cuboid_optimizer"
     elif args.use_geometry_verified_cuboid_optimizer:
         method_name = "geometry_verified_cuboid_optimizer_step3"
+    elif args.use_openbox_bidirectional_cluster_refine:
+        method_name = "openbox_bidirectional_cluster_refine_original_pca"
     elif (
         args.use_depth_edge_filter
         or args.use_depth_aware_mask_selector
@@ -5331,6 +5542,11 @@ def main():
     output["info"]["ovscan_main_min_quality"] = float(args.ovscan_main_min_quality)
     output["info"]["ovscan_external_min_quality"] = float(args.ovscan_external_min_quality)
     output["info"]["openbox_context_refinement"] = bool(args.use_openbox_context_refinement)
+    output["info"]["openbox_bidirectional_cluster_refine"] = bool(
+        args.use_openbox_bidirectional_cluster_refine
+    )
+    output["info"]["openbox_bidir_alpha"] = float(args.openbox_bidir_alpha)
+    output["info"]["openbox_bidir_beta"] = float(args.openbox_bidir_beta)
     output["info"]["openbox_context_bbox_pad_ratio"] = float(args.openbox_context_bbox_pad_ratio)
     output["info"]["physical_type_adaptive_box"] = bool(args.use_physical_type_adaptive_box)
     output["info"]["openbox_adaptive_completion"] = bool(args.use_openbox_adaptive_completion)
