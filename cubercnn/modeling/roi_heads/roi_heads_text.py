@@ -367,6 +367,12 @@ class ROIHeads3D_Text(StandardROIHeads):
         use_pseudo_weight=None,
         use_factorized_pseudo_weight=None,
         factorized_pseudo_weight_min=None,
+        use_distributional_pseudo_labels=None,
+        distributional_num_candidates=None,
+        loss_w_distributional=None,
+        distributional_temperature=None,
+        distributional_min_candidate_weight=None,
+        distributional_use_factorized_weight=None,
         use_locate3d_cos_curriculum=None,
         locate3d_near_z=None,
         locate3d_far_z=None,
@@ -435,6 +441,24 @@ class ROIHeads3D_Text(StandardROIHeads):
             0.05
             if factorized_pseudo_weight_min is None
             else factorized_pseudo_weight_min
+        )
+        self.use_distributional_pseudo_labels = bool(
+            use_distributional_pseudo_labels
+        )
+        self.distributional_num_candidates = int(
+            8 if distributional_num_candidates is None else distributional_num_candidates
+        )
+        self.loss_w_distributional = float(loss_w_distributional or 0.0)
+        self.distributional_temperature = float(
+            0.20 if distributional_temperature is None else distributional_temperature
+        )
+        self.distributional_min_candidate_weight = float(
+            1e-4
+            if distributional_min_candidate_weight is None
+            else distributional_min_candidate_weight
+        )
+        self.distributional_use_factorized_weight = bool(
+            distributional_use_factorized_weight
         )
         self.use_locate3d_cos_curriculum = bool(use_locate3d_cos_curriculum)
         self.locate3d_near_z = float(1.0 if locate3d_near_z is None else locate3d_near_z)
@@ -736,6 +760,12 @@ class ROIHeads3D_Text(StandardROIHeads):
             'use_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_PSEUDO_WEIGHT,
             'use_factorized_pseudo_weight': cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT,
             'factorized_pseudo_weight_min': cfg.MODEL.ROI_CUBE_HEAD.FACTORIZED_PSEUDO_WEIGHT_MIN,
+            'use_distributional_pseudo_labels': cfg.MODEL.ROI_CUBE_HEAD.USE_DISTRIBUTIONAL_PSEUDO_LABELS,
+            'distributional_num_candidates': cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_NUM_CANDIDATES,
+            'loss_w_distributional': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DISTRIBUTIONAL,
+            'distributional_temperature': cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_TEMPERATURE,
+            'distributional_min_candidate_weight': cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_MIN_CANDIDATE_WEIGHT,
+            'distributional_use_factorized_weight': cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_USE_FACTORIZED_WEIGHT,
             'use_locate3d_cos_curriculum': cfg.MODEL.ROI_CUBE_HEAD.USE_LOCATE3D_COS_CURRICULUM,
             'locate3d_near_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_NEAR_Z,
             'locate3d_far_z': cfg.MODEL.ROI_CUBE_HEAD.LOCATE3D_FAR_Z,
@@ -1496,6 +1526,176 @@ class ROIHeads3D_Text(StandardROIHeads):
         }
         return weights, stats
 
+    def softmin_distributional_loss(self, cost, valid, weights):
+        temperature = max(float(self.distributional_temperature), 1e-4)
+        weights = torch.where(valid, weights.clamp(min=0.0), torch.zeros_like(weights))
+        weight_sum = weights.sum(dim=1, keepdim=True)
+        valid_sample = valid.any(dim=1) & (weight_sum[:, 0] > 0)
+        weights = weights / weight_sum.clamp(min=1e-12)
+        log_prior = torch.log(
+            weights.clamp(min=max(float(self.distributional_min_candidate_weight), 1e-12))
+        )
+        logits = log_prior - cost / temperature
+        logits = torch.where(
+            valid,
+            logits,
+            torch.full_like(logits, -1e6),
+        )
+        loss = -temperature * torch.logsumexp(logits, dim=1)
+        return loss, valid_sample
+
+    def distributional_pseudo_label_losses(
+        self,
+        cube_x,
+        cube_y,
+        cube_z,
+        cube_dims,
+        cube_pose,
+        candidate_boxes3d,
+        candidate_poses,
+        candidate_weights,
+        candidate_valid,
+        src_scales,
+        gt_factor_weights,
+        gt_pseudo_weight,
+    ):
+        if candidate_boxes3d is None or candidate_boxes3d.numel() == 0:
+            return {}, {}
+
+        device = cube_z.device
+        candidate_boxes3d = candidate_boxes3d.to(device)
+        candidate_poses = candidate_poses.to(device)
+        candidate_weights = candidate_weights.to(device)
+        candidate_valid = candidate_valid.to(device).bool()
+
+        candidate_xy = candidate_boxes3d[..., :2]
+        candidate_z = candidate_boxes3d[..., 2].clamp(min=0.05)
+        candidate_dims = candidate_boxes3d[..., 3:6].clamp(min=0.01)
+        finite = (
+            torch.isfinite(candidate_boxes3d).all(dim=-1)
+            & torch.isfinite(candidate_poses).flatten(2).all(dim=-1)
+            & (candidate_boxes3d[..., 2] > 0.05)
+            & (candidate_boxes3d[..., 3:6] > 0.0).all(dim=-1)
+        )
+        valid = candidate_valid & finite
+        if not valid.any():
+            return {}, {"valid": cube_z.new_tensor(0.0)}
+
+        scale = src_scales.to(device).clamp(min=1.0)[:, None, None]
+        pred_xy = torch.stack((cube_x, cube_y), dim=1)[:, None, :].expand_as(
+            candidate_xy
+        )
+        xy_cost = F.smooth_l1_loss(
+            pred_xy / scale,
+            candidate_xy / scale,
+            reduction="none",
+            beta=0.02,
+        ).sum(dim=-1)
+
+        pred_z = cube_z[:, None].expand_as(candidate_z)
+        z_cost = F.smooth_l1_loss(
+            torch.log(pred_z.clamp(0.05, 80.0)),
+            torch.log(candidate_z.clamp(0.05, 80.0)),
+            reduction="none",
+            beta=0.05,
+        )
+
+        pred_dims = cube_dims[:, None, :].expand_as(candidate_dims)
+        dims_cost = F.smooth_l1_loss(
+            torch.log(pred_dims.clamp(0.01, 20.0)),
+            torch.log(candidate_dims.clamp(0.01, 20.0)),
+            reduction="none",
+            beta=0.05,
+        ).mean(dim=-1)
+
+        relative_rotation = torch.matmul(
+            cube_pose[:, None].transpose(-1, -2),
+            candidate_poses,
+        )
+        trace = relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        pose_cost = 1.0 - ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+
+        candidate_weights = candidate_weights.clamp(min=0.0)
+        if self.distributional_use_factorized_weight and gt_factor_weights:
+            factor_source = {
+                name: gt_factor_weights.get(name, gt_pseudo_weight).to(device).clamp(0.05, 1.0)
+                for name in ("xy", "z", "dims", "pose", "joint")
+            }
+        else:
+            base_weight = gt_pseudo_weight.to(device).clamp(0.05, 1.0)
+            factor_source = {
+                name: base_weight for name in ("xy", "z", "dims", "pose", "joint")
+            }
+
+        loss_xy, valid_xy = self.softmin_distributional_loss(
+            xy_cost,
+            valid,
+            candidate_weights,
+        )
+        loss_z, valid_z = self.softmin_distributional_loss(
+            z_cost,
+            valid,
+            candidate_weights,
+        )
+        loss_dims, valid_dims = self.softmin_distributional_loss(
+            dims_cost,
+            valid,
+            candidate_weights,
+        )
+        loss_pose, valid_pose = self.softmin_distributional_loss(
+            pose_cost,
+            valid,
+            candidate_weights,
+        )
+        joint_cost = (
+            xy_cost
+            + z_cost
+            + dims_cost
+            + pose_cost
+        ) * 0.25
+        loss_joint, valid_joint = self.softmin_distributional_loss(
+            joint_cost,
+            valid,
+            candidate_weights,
+        )
+
+        losses = {}
+        component_values = []
+        for name, values, valid_mask in (
+            ("xy", loss_xy, valid_xy),
+            ("z", loss_z, valid_z),
+            ("dims", loss_dims, valid_dims),
+            ("pose", loss_pose, valid_pose),
+            ("joint", loss_joint, valid_joint),
+        ):
+            if valid_mask.any():
+                weighted = values[valid_mask] * factor_source[name][valid_mask]
+                component = self.safely_reduce_losses(weighted)
+                losses[f"distributional_{name}"] = component
+                component_values.append(component)
+
+        if component_values:
+            losses["distributional_total"] = sum(component_values) / float(
+                len(component_values)
+            )
+
+        valid_count = valid.float().sum(dim=1)
+        normalized_weights = candidate_weights * valid.float()
+        normalized_weights = normalized_weights / normalized_weights.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp(min=1e-12)
+        entropy = -(
+            normalized_weights
+            * torch.log(normalized_weights.clamp(min=1e-12))
+        ).sum(dim=1)
+        stats = {
+            "valid": (valid_count > 0).float().mean(),
+            "candidate_count": valid_count.mean(),
+            "entropy": entropy[valid_count > 0].mean() if (valid_count > 0).any() else entropy.new_tensor(0.0),
+        }
+        return losses, stats
+
     # optionally, scale proposals to zoom RoI in (<1.0) our out (>1.0)
     def scale_proposals(self, proposal_boxes):
         if self.scale_roi_boxes > 0:
@@ -1599,6 +1799,31 @@ class ROIHeads3D_Text(StandardROIHeads):
                 gt_pag_score,
                 gt_projected_corner_depth_score,
             ).clamp(0.05, 1.0)
+            if (
+                len(proposals)
+                and proposals[0].has("gt_distributional_candidate_boxes3D")
+            ):
+                gt_distributional_candidate_boxes3D = torch.cat(
+                    [p.gt_distributional_candidate_boxes3D for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device)
+                gt_distributional_candidate_poses = torch.cat(
+                    [p.gt_distributional_candidate_poses for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device)
+                gt_distributional_candidate_weights = torch.cat(
+                    [p.gt_distributional_candidate_weights for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device)
+                gt_distributional_candidate_valid = torch.cat(
+                    [p.gt_distributional_candidate_valid for p in proposals],
+                    dim=0,
+                ).to(gt_boxes3D.device)
+            else:
+                gt_distributional_candidate_boxes3D = None
+                gt_distributional_candidate_poses = None
+                gt_distributional_candidate_weights = None
+                gt_distributional_candidate_valid = None
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
 
         # eval on all instances
@@ -2630,6 +2855,48 @@ class ROIHeads3D_Text(StandardROIHeads):
                     storage.put_scalar(
                         prefix + f'pseudo_weight_{factor_name}',
                         factor_weight.mean().item(),
+                        smoothing_hint=False,
+                    )
+
+            if (
+                self.use_distributional_pseudo_labels
+                and self.loss_w_distributional > 0
+                and gt_distributional_candidate_boxes3D is not None
+            ):
+                distributional_losses, distributional_stats = (
+                    self.distributional_pseudo_label_losses(
+                        cube_x,
+                        cube_y,
+                        cube_z,
+                        cube_dims,
+                        cube_pose,
+                        gt_distributional_candidate_boxes3D,
+                        gt_distributional_candidate_poses,
+                        gt_distributional_candidate_weights,
+                        gt_distributional_candidate_valid,
+                        src_scales,
+                        gt_factor_weights,
+                        gt_pseudo_weight,
+                    )
+                )
+                if "distributional_total" in distributional_losses:
+                    losses[prefix + "loss_distributional"] = (
+                        distributional_losses["distributional_total"]
+                        * self.loss_w_distributional
+                        * self.loss_w_3d
+                    )
+                    for component_name, component_value in distributional_losses.items():
+                        if component_name == "distributional_total":
+                            continue
+                        storage.put_scalar(
+                            prefix + component_name,
+                            float(component_value.detach().item()),
+                            smoothing_hint=False,
+                        )
+                for stat_name, stat_value in distributional_stats.items():
+                    storage.put_scalar(
+                        prefix + "distributional_" + stat_name,
+                        float(stat_value.detach().item()),
                         smoothing_hint=False,
                     )
 

@@ -123,6 +123,16 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.USE_FACTORIZED_PSEUDO_WEIGHT = False
     cfg.MODEL.ROI_CUBE_HEAD.FACTORIZED_PSEUDO_WEIGHT_MIN = 0.05
 
+    # Distributional pseudo-label supervision. Instead of treating a single
+    # pseudo 3D box as the only target, this reads a top-K candidate set from
+    # the JSON and applies a soft-min loss over the candidate distribution.
+    cfg.MODEL.ROI_CUBE_HEAD.USE_DISTRIBUTIONAL_PSEUDO_LABELS = False
+    cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_NUM_CANDIDATES = 8
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DISTRIBUTIONAL = 0.05
+    cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_TEMPERATURE = 0.20
+    cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_MIN_CANDIDATE_WEIGHT = 1e-4
+    cfg.MODEL.ROI_CUBE_HEAD.DISTRIBUTIONAL_USE_FACTORIZED_WEIGHT = True
+
     # LocateAnything3D-style lightweight Chain-of-Sight curriculum. This is a
     # training-only pseudo-label reweighting layer: first estimate whether the
     # 3D target is supported by 2D/projected evidence, then apply an easy-to-hard

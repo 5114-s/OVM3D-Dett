@@ -407,6 +407,7 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
         "pseudo_weight_xy", "pseudo_weight_z", "pseudo_weight_dims",
         "pseudo_weight_pose", "pseudo_weight_joint",
         "pag_score", "moca3d_projected_corner_depth_score",
+        "latent_box_candidates", "distributional_box_candidates",
         "pseudo_mask_index",
     ]
     

@@ -37,6 +37,9 @@ class DatasetMapper3D(DatasetMapper):
         )
         self.use_ground_mask = bool(getattr(cfg.INPUT, "USE_GROUND_MASK", False))
         self.ground_mask_root = str(getattr(cfg.INPUT, "GROUND_MASK_ROOT", ""))
+        self.distributional_num_candidates = int(
+            getattr(cfg.MODEL.ROI_CUBE_HEAD, "DISTRIBUTIONAL_NUM_CANDIDATES", 8)
+        )
 
     def __call__(self, dataset_dict):
         
@@ -108,7 +111,12 @@ class DatasetMapper3D(DatasetMapper):
                 self._attach_render_masks(annos, pseudo_masks, image_shape)
 
             # convert to instance format
-            instances = annotations_to_instances(annos, image_shape, unknown_categories)
+            instances = annotations_to_instances(
+                annos,
+                image_shape,
+                unknown_categories,
+                distributional_num_candidates=self.distributional_num_candidates,
+            )
             dataset_dict["instances"] = detection_utils.filter_empty_instances(instances)
 
         return dataset_dict
@@ -420,10 +428,116 @@ def transform_instance_annotations(annotation, transforms, *, K):
                 annotation["pose"] = pose.tolist()
                 annotation["R_cam"] = pose.tolist()
 
+        transform_distributional_candidates(annotation, transforms, K)
+
     return annotation
 
 
-def annotations_to_instances(annos, image_size, unknown_categories):
+def transform_distributional_candidates(annotation, transforms, K):
+    raw_candidates = annotation.get("distributional_box_candidates", None)
+    if raw_candidates is None:
+        raw_candidates = annotation.get("latent_box_candidates", None)
+    if not isinstance(raw_candidates, list):
+        return
+
+    transformed = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate = copy.deepcopy(candidate)
+        center = candidate.get("center_cam", None)
+        if center is not None:
+            try:
+                point3d = np.asarray(center, dtype=np.float32).reshape(3)
+                if np.all(np.isfinite(point3d)) and point3d[2] > 0:
+                    point2d = K @ point3d
+                    point2d[:2] = point2d[:2] / max(float(point2d[-1]), 1e-6)
+                    point2d[:2] = transforms.apply_coords(
+                        point2d[np.newaxis, :2]
+                    )[0]
+                    candidate["center_cam_proj"] = point2d[:2].tolist()
+            except Exception:
+                pass
+
+        pose = candidate.get("R_cam", candidate.get("pose", None))
+        if pose is not None:
+            try:
+                pose = np.asarray(pose, dtype=np.float32).reshape(3, 3)
+                for transform in transforms:
+                    if isinstance(transform, T.HFlipTransform):
+                        pose = _M1 @ pose @ _M2
+                candidate["R_cam"] = pose.tolist()
+                candidate["pose"] = pose.tolist()
+            except Exception:
+                pass
+        transformed.append(candidate)
+
+    annotation["distributional_box_candidates"] = transformed
+
+
+def _distributional_candidates_to_tensors(anno, max_candidates):
+    candidates = anno.get("distributional_box_candidates", None)
+    if candidates is None:
+        candidates = anno.get("latent_box_candidates", None)
+    if not isinstance(candidates, list):
+        candidates = []
+
+    boxes = np.zeros((max_candidates, 6), dtype=np.float32)
+    poses = np.zeros((max_candidates, 3, 3), dtype=np.float32)
+    weights = np.zeros((max_candidates,), dtype=np.float32)
+    valid = np.zeros((max_candidates,), dtype=np.bool_)
+
+    out_index = 0
+    for candidate in candidates:
+        if out_index >= max_candidates:
+            break
+        if not isinstance(candidate, dict):
+            continue
+        center = candidate.get("center_cam", None)
+        center_proj = candidate.get("center_cam_proj", None)
+        dims = candidate.get("dimensions", None)
+        pose = candidate.get("R_cam", candidate.get("pose", None))
+        if center is None or center_proj is None or dims is None or pose is None:
+            continue
+        try:
+            center = np.asarray(center, dtype=np.float32).reshape(3)
+            center_proj = np.asarray(center_proj, dtype=np.float32).reshape(2)
+            dims = np.asarray(dims, dtype=np.float32).reshape(3)
+            pose = np.asarray(pose, dtype=np.float32).reshape(3, 3)
+        except Exception:
+            continue
+        if (
+            not np.all(np.isfinite(center))
+            or not np.all(np.isfinite(center_proj))
+            or not np.all(np.isfinite(dims))
+            or not np.all(np.isfinite(pose))
+            or center[2] <= 0.05
+            or np.any(dims <= 0.0)
+        ):
+            continue
+        weight = candidate.get("posterior", candidate.get("score", candidate.get("weight", 1.0)))
+        try:
+            weight = float(weight)
+        except Exception:
+            weight = 1.0
+        boxes[out_index] = np.asarray(
+            [center_proj[0], center_proj[1], center[2], dims[0], dims[1], dims[2]],
+            dtype=np.float32,
+        )
+        poses[out_index] = pose
+        weights[out_index] = max(weight, 0.0)
+        valid[out_index] = True
+        out_index += 1
+
+    return boxes, poses, weights, valid
+
+
+def annotations_to_instances(
+    annos,
+    image_size,
+    unknown_categories,
+    distributional_num_candidates=8,
+):
 
     # init
     target = Instances(image_size)
@@ -464,6 +578,23 @@ def annotations_to_instances(annos, image_size, unknown_categories):
                 corner_score = anno.get("pag_score", 1.0) if corner_score else 0.05
             corner_depth_scores.append(float(corner_score))
         target.gt_projected_corner_depth_score = torch.FloatTensor(corner_depth_scores).clamp(0.05, 1.0)
+        candidate_boxes = []
+        candidate_poses = []
+        candidate_weights = []
+        candidate_valid = []
+        for anno in annos:
+            boxes_i, poses_i, weights_i, valid_i = _distributional_candidates_to_tensors(
+                anno,
+                int(distributional_num_candidates),
+            )
+            candidate_boxes.append(torch.from_numpy(boxes_i))
+            candidate_poses.append(torch.from_numpy(poses_i))
+            candidate_weights.append(torch.from_numpy(weights_i))
+            candidate_valid.append(torch.from_numpy(valid_i))
+        target.gt_distributional_candidate_boxes3D = torch.stack(candidate_boxes, dim=0)
+        target.gt_distributional_candidate_poses = torch.stack(candidate_poses, dim=0)
+        target.gt_distributional_candidate_weights = torch.stack(candidate_weights, dim=0)
+        target.gt_distributional_candidate_valid = torch.stack(candidate_valid, dim=0)
     else:
         target.gt_pseudo_weight = torch.FloatTensor([])
         for factor_name in ("xy", "z", "dims", "pose", "joint"):
@@ -471,6 +602,22 @@ def annotations_to_instances(annos, image_size, unknown_categories):
         target.gt_render_masks = torch.empty((0, 28, 28), dtype=torch.float32)
         target.gt_pag_score = torch.FloatTensor([])
         target.gt_projected_corner_depth_score = torch.FloatTensor([])
+        target.gt_distributional_candidate_boxes3D = torch.empty(
+            (0, int(distributional_num_candidates), 6),
+            dtype=torch.float32,
+        )
+        target.gt_distributional_candidate_poses = torch.empty(
+            (0, int(distributional_num_candidates), 3, 3),
+            dtype=torch.float32,
+        )
+        target.gt_distributional_candidate_weights = torch.empty(
+            (0, int(distributional_num_candidates)),
+            dtype=torch.float32,
+        )
+        target.gt_distributional_candidate_valid = torch.empty(
+            (0, int(distributional_num_candidates)),
+            dtype=torch.bool,
+        )
     
     n = len(target.gt_classes)
 
