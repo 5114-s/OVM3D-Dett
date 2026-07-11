@@ -27,6 +27,7 @@ from tools.lifthead_common import (  # noqa: E402
     cached_roi_feature,
     cuboid_corners,
     finite_float,
+    load_depth_map,
     load_image_rgb,
     load_roi_feature_cache,
     projected_box_from_corners,
@@ -68,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cached ROI features matching source_json annotation ids.",
     )
+    parser.add_argument("--depth_root", default=None, help="Optional cached metric depth root.")
+    parser.add_argument("--depth_split", default=None, help="Depth split under --depth_root.")
+    parser.add_argument(
+        "--depth_feature_mode",
+        choices=["auto", "none", "box_stats"],
+        default="auto",
+        help="Use checkpoint depth config by default; override only for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -108,6 +117,15 @@ def main() -> None:
     roi_cfg.setdefault("mode", "none")
     roi_cfg.setdefault("grid_size", 4)
     roi_cfg.setdefault("context_scale", 1.15)
+    depth_cfg = dict(ckpt.get("depth_feature_config") or {"mode": "none"})
+    if args.depth_feature_mode != "auto":
+        depth_cfg["mode"] = args.depth_feature_mode
+    depth_cfg.setdefault("mode", "none")
+    depth_cfg.setdefault("context_scale", 1.05)
+    if args.depth_root:
+        depth_cfg["root"] = args.depth_root
+    if args.depth_split:
+        depth_cfg["split"] = args.depth_split
     roi_cache, roi_cache_names, _roi_cache_config = load_roi_feature_cache(args.roi_feature_cache)
     expected_cache_names = list(ckpt.get("roi_feature_cache_names") or [])
     roi_cache_dim = len(expected_cache_names)
@@ -132,7 +150,9 @@ def main() -> None:
     features = []
     cats = []
     image_cache: Dict[int, np.ndarray | None] = {}
+    depth_cache: Dict[int, np.ndarray | None] = {}
     use_roi = roi_cfg.get("mode", "none") != "none"
+    use_depth = depth_cfg.get("mode", "none") != "none"
 
     def get_image_rgb(image: dict) -> np.ndarray | None:
         if not use_roi:
@@ -141,6 +161,18 @@ def main() -> None:
         if image_id not in image_cache:
             image_cache[image_id] = load_image_rgb(args.image_root, image)
         return image_cache[image_id]
+
+    def get_depth_map(image: dict) -> np.ndarray | None:
+        if not use_depth:
+            return None
+        image_id = int(image["id"])
+        if image_id not in depth_cache:
+            depth_cache[image_id] = load_depth_map(
+                depth_cfg.get("root"),
+                image_id,
+                depth_cfg.get("split"),
+            )
+        return depth_cache[image_id]
 
     for idx, ann in enumerate(output.get("annotations", [])):
         if selected is not None and int(ann.get("image_id", -1)) not in selected:
@@ -158,6 +190,9 @@ def main() -> None:
             roi_feature_mode=str(roi_cfg.get("mode", "none")),
             roi_grid_size=int(roi_cfg.get("grid_size", 4)),
             roi_context_scale=float(roi_cfg.get("context_scale", 1.15)),
+            depth_map=get_depth_map(image),
+            depth_feature_mode=str(depth_cfg.get("mode", "none")),
+            depth_context_scale=float(depth_cfg.get("context_scale", 1.05)),
         )
         if roi_cache_dim > 0:
             feature = np.concatenate(
@@ -250,6 +285,7 @@ def main() -> None:
     info["lifthead_blend"] = args.blend
     info["lifthead_update_yaw"] = bool(args.update_yaw)
     info["lifthead_roi_feature_config"] = roi_cfg
+    info["lifthead_depth_feature_config"] = depth_cfg
     info["lifthead_roi_feature_cache"] = os.path.abspath(args.roi_feature_cache) if args.roi_feature_cache else None
     info["lifthead_stats"] = stats
 

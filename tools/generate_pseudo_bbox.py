@@ -57,11 +57,12 @@ MAX_TRAINING_ATTEMPTS = 10
 def generate_pseudo_label(cfg):
 
     dataset_names = cfg.DATASETS.TRAIN
+    pseudo_label_root = os.environ.get("PSEUDO_LABEL_ROOT", "pseudo_label")
 
     for dataset_name in dataset_names:
 
         dataset, mode = dataset_name.split('_')
-        input_folder = f'pseudo_label/{dataset}/{mode}'
+        input_folder = os.path.join(pseudo_label_root, dataset, mode)
         output_folder = os.path.join(cfg.OUTPUT_DIR, dataset, mode)
 
         data_loader = build_detection_test_loader(cfg, dataset_name)

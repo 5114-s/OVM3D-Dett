@@ -29,6 +29,7 @@ from tools.lifthead_common import (  # noqa: E402
     cached_roi_feature,
     feature_names_with_roi,
     finite_float,
+    load_depth_map,
     load_image_rgb,
     load_roi_feature_cache,
     target_from_pair,
@@ -69,6 +70,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cached ROI features from extract_lifthead_roi_features.py.",
     )
+    parser.add_argument(
+        "--depth_root",
+        default=None,
+        help="Optional cached metric depth root, e.g. pseudo_label/SUNRGBD.",
+    )
+    parser.add_argument(
+        "--depth_split",
+        default=None,
+        help="Depth split name under --depth_root. Defaults to JSON split inferred by caller.",
+    )
+    parser.add_argument(
+        "--depth_feature_mode",
+        choices=["none", "box_stats"],
+        default="none",
+        help="Append Boxer-style robust depth patch statistics to LiftHead features.",
+    )
+    parser.add_argument("--depth_context_scale", type=float, default=1.05)
     return parser.parse_args()
 
 
@@ -171,7 +189,9 @@ def main() -> None:
     target_ann_ids = []
     image_ids = []
     image_cache: Dict[int, np.ndarray | None] = {}
+    depth_cache: Dict[int, np.ndarray | None] = {}
     use_roi = args.roi_feature_mode != "none"
+    use_depth = args.depth_feature_mode != "none"
     roi_cache, roi_cache_names, roi_cache_config = load_roi_feature_cache(args.roi_feature_cache)
     roi_cache_dim = len(roi_cache_names)
 
@@ -182,6 +202,14 @@ def main() -> None:
         if image_id not in image_cache:
             image_cache[image_id] = load_image_rgb(args.image_root, image)
         return image_cache[image_id]
+
+    def get_depth_map(image: Mapping) -> np.ndarray | None:
+        if not use_depth:
+            return None
+        image_id = int(image["id"])
+        if image_id not in depth_cache:
+            depth_cache[image_id] = load_depth_map(args.depth_root, image_id, args.depth_split)
+        return depth_cache[image_id]
 
     total_groups = 0
     total_matches = 0
@@ -202,6 +230,9 @@ def main() -> None:
                 roi_feature_mode=args.roi_feature_mode,
                 roi_grid_size=args.roi_grid_size,
                 roi_context_scale=args.roi_context_scale,
+                depth_map=get_depth_map(image),
+                depth_feature_mode=args.depth_feature_mode,
+                depth_context_scale=args.depth_context_scale,
             )
             if roi_cache_dim > 0:
                 feature = np.concatenate(
@@ -232,12 +263,22 @@ def main() -> None:
         "image_ids": torch.tensor(image_ids, dtype=torch.long),
         "source_ann_ids": torch.tensor(source_ann_ids, dtype=torch.long),
         "target_ann_ids": torch.tensor(target_ann_ids, dtype=torch.long),
-        "feature_names": feature_names_with_roi(args.roi_feature_mode, args.roi_grid_size)
+        "feature_names": feature_names_with_roi(
+            args.roi_feature_mode,
+            args.roi_grid_size,
+            args.depth_feature_mode,
+        )
         + roi_cache_names,
         "roi_feature_config": {
             "mode": args.roi_feature_mode,
             "grid_size": int(args.roi_grid_size),
             "context_scale": float(args.roi_context_scale),
+        },
+        "depth_feature_config": {
+            "mode": args.depth_feature_mode,
+            "root": os.path.abspath(args.depth_root) if args.depth_root else None,
+            "split": args.depth_split,
+            "context_scale": float(args.depth_context_scale),
         },
         "roi_feature_cache_config": roi_cache_config,
         "roi_feature_cache_names": roi_cache_names,

@@ -9,10 +9,22 @@ import argparse
 def parse_args():
     parser = argparse.ArgumentParser(description="Dataset Configuration")
     parser.add_argument('--dataset_name', type=str, default='SUNRGBD', help='Name of the dataset')
+    parser.add_argument(
+        '--input_root',
+        type=str,
+        default='pseudo_label',
+        help='Pseudo-label cache root. Defaults to original pseudo_label.',
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='datasets/Omni3D_pl',
+        help='Output Omni3D pseudo-label folder. Defaults to original datasets/Omni3D_pl.',
+    )
     return parser.parse_args()
 
 
-def main(dataset_name):
+def main(dataset_name, input_root='pseudo_label', output_dir='datasets/Omni3D_pl'):
     mode_list = ['train', 'val']
 
     # Class mapping for each dataset
@@ -29,7 +41,7 @@ def main(dataset_name):
             data = json.load(file)
 
         # Load 3D information for the images
-        input_folder = f'pseudo_label/{dataset_name}/{mode}'
+        input_folder = os.path.join(input_root, dataset_name, mode)
         info = torch.load(f'{input_folder}/info_3d.pth')
 
         dataset_id = data['info']['id']
@@ -110,12 +122,12 @@ def main(dataset_name):
         # Update the JSON file with the pseudo-labels
         new_data = {'info': data['info'], 'images': data['images'], 'categories': data['categories'], 'annotations': annotations}
 
-        os.makedirs("datasets/Omni3D_pl", exist_ok=True)
-        new_file_path = f'datasets/Omni3D_pl/{dataset_name}_{mode}.json'
+        os.makedirs(output_dir, exist_ok=True)
+        new_file_path = os.path.join(output_dir, f'{dataset_name}_{mode}.json')
         with open(new_file_path, 'w') as new_file:
             json.dump(new_data, new_file)
 
 if __name__ == "__main__":
     args = parse_args()
     print(f"Dataset name: {args.dataset_name}")
-    main(args.dataset_name)
+    main(args.dataset_name, args.input_root, args.output_dir)

@@ -64,6 +64,24 @@ BASE_FEATURE_NAMES = [
 FEATURE_NAMES = BASE_FEATURE_NAMES
 
 
+DEPTH_FEATURE_NAMES = [
+    "depth_valid",
+    "depth_valid_ratio",
+    "depth_count_log",
+    "depth_median_log",
+    "depth_p10_log",
+    "depth_p90_log",
+    "depth_mean_log",
+    "depth_std_rel",
+    "depth_iqr_rel",
+    "depth_min_log",
+    "depth_max_log",
+    "anchor_z_over_depth_median_log",
+    "anchor_z_over_depth_p10_log",
+    "anchor_z_over_depth_p90_log",
+]
+
+
 def roi_feature_names(mode: str = "none", grid_size: int = 4) -> List[str]:
     if mode == "none":
         return []
@@ -82,8 +100,20 @@ def roi_feature_names(mode: str = "none", grid_size: int = 4) -> List[str]:
     return names
 
 
-def feature_names_with_roi(mode: str = "none", grid_size: int = 4) -> List[str]:
-    return BASE_FEATURE_NAMES + roi_feature_names(mode, grid_size)
+def depth_feature_names(mode: str = "none") -> List[str]:
+    if mode == "none":
+        return []
+    if mode != "box_stats":
+        raise ValueError(f"Unsupported depth feature mode: {mode}")
+    return list(DEPTH_FEATURE_NAMES)
+
+
+def feature_names_with_roi(
+    mode: str = "none",
+    grid_size: int = 4,
+    depth_feature_mode: str = "none",
+) -> List[str]:
+    return BASE_FEATURE_NAMES + roi_feature_names(mode, grid_size) + depth_feature_names(depth_feature_mode)
 
 
 def load_roi_feature_cache(path: str | None) -> Tuple[Dict[int, np.ndarray], List[str], Dict]:
@@ -158,6 +188,40 @@ def load_image_rgb(image_root: str, image: Mapping) -> np.ndarray | None:
             return np.asarray(im.convert("RGB"), dtype=np.uint8)
     except Exception:
         return None
+
+
+def resolve_depth_path(depth_root: str, image_id: int | str, split: str | None = None) -> str | None:
+    """Resolve cached metric depth paths used by the OVM3D pseudo-label pipeline."""
+    if not depth_root:
+        return None
+    image_id = str(image_id)
+    candidates = []
+    if split:
+        candidates.append(os.path.join(depth_root, split, "depth", f"{image_id}.npy"))
+    candidates.append(os.path.join(depth_root, "depth", f"{image_id}.npy"))
+    candidates.append(os.path.join(depth_root, f"{image_id}.npy"))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_depth_map(depth_root: str | None, image_id: int | str, split: str | None = None) -> np.ndarray | None:
+    if not depth_root:
+        return None
+    path = resolve_depth_path(depth_root, image_id, split)
+    if path is None:
+        return None
+    try:
+        depth = np.load(path)
+    except Exception:
+        return None
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.ndim > 2:
+        depth = np.squeeze(depth)
+    if depth.ndim != 2:
+        return None
+    return depth
 
 
 def normalize_angle(angle: float) -> float:
@@ -281,6 +345,93 @@ def extract_roi_feature(
         axis=0,
     )
     return values.astype(np.float32)
+
+
+def _depth_feature_zeros(mode: str) -> np.ndarray:
+    return np.zeros(len(depth_feature_names(mode)), dtype=np.float32)
+
+
+def extract_depth_patch_feature(
+    depth_map: np.ndarray | None,
+    ann: Mapping,
+    image: Mapping,
+    *,
+    mode: str = "none",
+    context_scale: float = 1.05,
+) -> np.ndarray:
+    """Boxer-style robust depth patch statistics for a 2D proposal.
+
+    These features are intentionally compact and model-agnostic: they encode
+    median/quantile depth support inside the 2D box and the relation between
+    that metric depth and the current anchor depth.  The LiftHead can then
+    learn residual corrections without being forced to trust every depth pixel.
+    """
+    if mode == "none":
+        return np.zeros(0, dtype=np.float32)
+    if mode != "box_stats":
+        raise ValueError(f"Unsupported depth feature mode: {mode}")
+    if depth_map is None or depth_map.ndim != 2:
+        return _depth_feature_zeros(mode)
+
+    height = max(float(image.get("height", depth_map.shape[0])), 1.0)
+    width = max(float(image.get("width", depth_map.shape[1])), 1.0)
+    box = xyxy_from_ann(ann)
+    if np.any(box < 0):
+        return _depth_feature_zeros(mode)
+
+    x1, y1, x2, y2 = [float(v) for v in box]
+    bw = max(x2 - x1, 1.0)
+    bh = max(y2 - y1, 1.0)
+    cx = x1 + 0.5 * bw
+    cy = y1 + 0.5 * bh
+    scale = max(float(context_scale), 1.0)
+    x1 = cx - 0.5 * bw * scale
+    x2 = cx + 0.5 * bw * scale
+    y1 = cy - 0.5 * bh * scale
+    y2 = cy + 0.5 * bh * scale
+
+    h_img, w_img = depth_map.shape[:2]
+    ix1 = int(np.floor(np.clip(x1 / width * w_img, 0, w_img - 1)))
+    ix2 = int(np.ceil(np.clip(x2 / width * w_img, ix1 + 1, w_img)))
+    iy1 = int(np.floor(np.clip(y1 / height * h_img, 0, h_img - 1)))
+    iy2 = int(np.ceil(np.clip(y2 / height * h_img, iy1 + 1, h_img)))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return _depth_feature_zeros(mode)
+
+    patch = depth_map[iy1:iy2, ix1:ix2].reshape(-1)
+    valid = patch[np.isfinite(patch) & (patch > EPS)]
+    total = max(int(patch.size), 1)
+    if valid.size < 3:
+        return _depth_feature_zeros(mode)
+
+    p10, p50, p90 = np.percentile(valid, [10.0, 50.0, 90.0])
+    p25, p75 = np.percentile(valid, [25.0, 75.0])
+    mean = float(np.mean(valid))
+    std = float(np.std(valid))
+    min_d = float(np.min(valid))
+    max_d = float(np.max(valid))
+    med = max(float(p50), EPS)
+
+    center = np.asarray(ann.get("center_cam", [0.0, 0.0, med]), dtype=np.float32).reshape(-1)
+    anchor_z = float(center[2]) if center.shape[0] >= 3 and np.isfinite(center[2]) and center[2] > EPS else med
+
+    values = [
+        1.0,
+        float(valid.size) / float(total),
+        math.log(float(valid.size) + 1.0),
+        math.log(max(float(p50), EPS)),
+        math.log(max(float(p10), EPS)),
+        math.log(max(float(p90), EPS)),
+        math.log(max(mean, EPS)),
+        std / med,
+        max(float(p75 - p25), 0.0) / med,
+        math.log(max(min_d, EPS)),
+        math.log(max(max_d, EPS)),
+        math.log(max(anchor_z, EPS) / max(float(p50), EPS)),
+        math.log(max(anchor_z, EPS) / max(float(p10), EPS)),
+        math.log(max(anchor_z, EPS) / max(float(p90), EPS)),
+    ]
+    return np.asarray(values, dtype=np.float32)
 
 
 def box_iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
@@ -431,6 +582,9 @@ def build_feature_vector_with_roi(
     roi_feature_mode: str = "none",
     roi_grid_size: int = 4,
     roi_context_scale: float = 1.15,
+    depth_map: np.ndarray | None = None,
+    depth_feature_mode: str = "none",
+    depth_context_scale: float = 1.05,
 ) -> np.ndarray:
     base = build_feature_vector(ann, image)
     roi = extract_roi_feature(
@@ -441,9 +595,19 @@ def build_feature_vector_with_roi(
         grid_size=roi_grid_size,
         context_scale=roi_context_scale,
     )
-    if roi.size == 0:
-        return base
-    return np.concatenate([base, roi], axis=0).astype(np.float32)
+    depth = extract_depth_patch_feature(
+        depth_map,
+        ann,
+        image,
+        mode=depth_feature_mode,
+        context_scale=depth_context_scale,
+    )
+    parts = [base]
+    if roi.size > 0:
+        parts.append(roi)
+    if depth.size > 0:
+        parts.append(depth)
+    return np.concatenate(parts, axis=0).astype(np.float32)
 
 
 def target_from_pair(source_ann: Mapping, target_ann: Mapping) -> np.ndarray:

@@ -187,6 +187,7 @@ def main() -> None:
             "feature_std": feature_std,
             "feature_names": train_data.get("feature_names"),
             "roi_feature_config": train_data.get("roi_feature_config", {"mode": "none"}),
+            "depth_feature_config": train_data.get("depth_feature_config", {"mode": "none"}),
             "roi_feature_cache_config": train_data.get("roi_feature_cache_config", {}),
             "roi_feature_cache_names": train_data.get("roi_feature_cache_names", []),
             "category_id_to_index": train_data.get("category_id_to_index"),

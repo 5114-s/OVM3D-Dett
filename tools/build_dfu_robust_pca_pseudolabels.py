@@ -86,6 +86,51 @@ DEFORMABLE_OR_SOFT_CLASSES = {
     "paper",
 }
 
+SEMANTIC_COMPATIBILITY_GROUPS = {
+    # Group3D-style scene-adaptive semantic gates, specialized to SUNRGBD names.
+    # These are intentionally conservative: they only suppress near-duplicate
+    # proposals, not nested objects such as pillow-on-sofa.
+    "seating": {"chair", "sofa"},
+    "table_surface": {"table", "desk", "counter", "night stand"},
+    "storage": {"shelves", "bookcase", "cabinet", "dresser", "drawers", "closet", "rack"},
+    "screen_electronics": {
+        "monitor",
+        "television",
+        "laptop",
+        "computer",
+        "electronics",
+        "projector",
+        "soundsystem",
+    },
+    "appliance": {
+        "refrigerator",
+        "microwave",
+        "oven",
+        "stove",
+        "coffee maker",
+        "toaster",
+        "fume hood",
+        "machine",
+        "printer",
+        "air conditioner",
+    },
+    "soft_item": {
+        "pillow",
+        "blanket",
+        "towel",
+        "clothes",
+        "curtain",
+        "shower curtain",
+        "blinds",
+        "floor mat",
+    },
+    "bag_like": {"bag", "box"},
+    "wall_hanging": {"picture", "painting", "mirror", "board", "clock"},
+    "tableware": {"bottle", "plates", "bowl", "cup", "glass", "utensils", "vase"},
+    "input_device": {"keyboard", "mouse", "remote", "phone", "pen", "stationery"},
+    "bathroom_fixture": {"toilet", "bathtub", "sink", "faucet", "toilet paper"},
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -110,6 +155,21 @@ def parse_args():
     parser.add_argument("--min_mask_fill_ratio", type=float, default=0.0)
     parser.add_argument("--max_mask_fill_ratio", type=float, default=2.0)
     parser.add_argument("--drop_invalid_annotations", action="store_true")
+    parser.add_argument(
+        "--use_semantic_compatibility_filter",
+        action="store_true",
+        help=(
+            "Group3D-style 2D proposal filter.  It groups semantically "
+            "compatible SUNRGBD categories and removes only highly-overlapping "
+            "duplicate/conflicting proposals before the original PCA pipeline."
+        ),
+    )
+    parser.add_argument("--semantic_duplicate_iou", type=float, default=0.70)
+    parser.add_argument("--semantic_duplicate_mask_iou", type=float, default=0.55)
+    parser.add_argument("--semantic_incompatible_iou", type=float, default=0.90)
+    parser.add_argument("--semantic_incompatible_mask_iou", type=float, default=0.80)
+    parser.add_argument("--semantic_min_score_ratio", type=float, default=0.55)
+    parser.add_argument("--semantic_min_area_ratio", type=float, default=0.35)
 
     parser.add_argument("--mask_erode_vertical", type=int, default=12)
     parser.add_argument("--mask_erode_vertical_min", type=int, default=2)
@@ -1390,6 +1450,205 @@ def physical_type_for_class(category_name: str) -> str:
     if name in DEFORMABLE_OR_SOFT_CLASSES:
         return "deformable_soft"
     return "generic"
+
+
+def semantic_group_for_class(category_name: str) -> str:
+    name = str(category_name).lower().strip()
+    for group_name, members in SEMANTIC_COMPATIBILITY_GROUPS.items():
+        if name in members:
+            return group_name
+    return f"class:{name}"
+
+
+def bbox_iou_xyxy_np(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+    bx1, by1, bx2, by2 = [float(v) for v in box_b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1 + 1.0), max(0.0, iy2 - iy1 + 1.0)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1 + 1.0) * max(0.0, ay2 - ay1 + 1.0)
+    area_b = max(0.0, bx2 - bx1 + 1.0) * max(0.0, by2 - by1 + 1.0)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+def mask_iou_np(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = np.asarray(mask_a).squeeze() > 0
+    b = np.asarray(mask_b).squeeze() > 0
+    inter = int(np.logical_and(a, b).sum())
+    union = int(np.logical_or(a, b).sum())
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+def semantic_proposal_score(
+    phrase: str,
+    score: float,
+    bbox: Sequence[float],
+    mask: np.ndarray,
+    width: int,
+    height: int,
+) -> Tuple[float, Dict[str, object]]:
+    mask_pixels = float((np.asarray(mask).squeeze() > 0).sum())
+    bbox_area = bbox_area_pixels(bbox, height, width)
+    fill_ratio = mask_pixels / max(bbox_area, 1.0)
+    # A reasonable instance mask should not be either nearly empty or almost
+    # the whole box for most SUNRGBD objects.  Use this only as a soft tie-break.
+    fill_score = float(np.clip(fill_ratio / 0.18, 0.0, 1.0) * np.clip(1.25 / max(fill_ratio, 1e-6), 0.0, 1.0))
+    area_ratio = float(bbox_area / max(float(width * height), 1.0))
+    area_score = float(np.clip(area_ratio / 0.0004, 0.0, 1.0) * np.clip(0.65 / max(area_ratio, 1e-6), 0.0, 1.0))
+    quality = float(0.70 * score + 0.20 * fill_score + 0.10 * area_score)
+    return quality, {
+        "semantic_group": semantic_group_for_class(phrase),
+        "semantic_filter_score": quality,
+        "semantic_filter_mask_fill_ratio": fill_ratio,
+        "semantic_filter_area_ratio": area_ratio,
+    }
+
+
+def semantic_compatibility_filter(
+    phrases: Sequence[str],
+    boxes,
+    masks: np.ndarray,
+    scores,
+    width: int,
+    height: int,
+    args,
+) -> Tuple[set, Dict[int, Dict[str, object]], Dict[str, int]]:
+    n = min(len(phrases), len(boxes), masks.shape[0])
+    keep = set(range(n))
+    metadata: Dict[int, Dict[str, object]] = {}
+    stats: Dict[str, int] = {
+        "semantic_filter_seen": int(n),
+        "semantic_filter_enabled": int(bool(args.use_semantic_compatibility_filter)),
+        "semantic_filter_suppressed": 0,
+        "semantic_filter_suppressed_same_class": 0,
+        "semantic_filter_suppressed_compatible": 0,
+        "semantic_filter_suppressed_incompatible_duplicate": 0,
+        "semantic_filter_low_quality_kept": 0,
+    }
+    if not bool(args.use_semantic_compatibility_filter) or n <= 1:
+        for idx in range(n):
+            name = str(phrases[idx]).lower().strip()
+            score = sanitize_detection_score(np.asarray(scores[idx]).reshape(-1)[0])
+            bbox = normalize_bbox_to_pixels(boxes[idx], width, height)
+            quality, item = semantic_proposal_score(name, score, bbox, masks[idx], width, height)
+            item.update(
+                {
+                    "semantic_filter_enabled": bool(args.use_semantic_compatibility_filter),
+                    "semantic_filter_kept": True,
+                    "semantic_filter_reason": "disabled" if not bool(args.use_semantic_compatibility_filter) else "single",
+                }
+            )
+            metadata[idx] = item
+        return keep, metadata, stats
+
+    proposals = []
+    for idx in range(n):
+        name = str(phrases[idx]).lower().strip()
+        score = sanitize_detection_score(np.asarray(scores[idx]).reshape(-1)[0])
+        bbox = normalize_bbox_to_pixels(boxes[idx], width, height)
+        quality, item = semantic_proposal_score(name, score, bbox, masks[idx], width, height)
+        item.update(
+            {
+                "semantic_filter_enabled": True,
+                "semantic_filter_kept": True,
+                "semantic_filter_reason": "kept",
+                "semantic_filter_category": name,
+            }
+        )
+        metadata[idx] = item
+        proposals.append(
+            {
+                "idx": idx,
+                "name": name,
+                "group": item["semantic_group"],
+                "score": score,
+                "quality": quality,
+                "bbox": bbox,
+            }
+        )
+
+    ordered = sorted(proposals, key=lambda item: item["quality"], reverse=True)
+    kept_items: List[dict] = []
+    keep = set()
+    for proposal in ordered:
+        idx = int(proposal["idx"])
+        suppress = False
+        reason = ""
+        matched = None
+        for kept in kept_items:
+            box_iou = bbox_iou_xyxy_np(proposal["bbox"], kept["bbox"])
+            if box_iou < min(float(args.semantic_duplicate_iou), float(args.semantic_incompatible_iou)):
+                continue
+            same_class = proposal["name"] == kept["name"]
+            compatible = proposal["group"] == kept["group"]
+            miou = mask_iou_np(masks[idx], masks[int(kept["idx"])])
+            quality_ratio = proposal["quality"] / max(float(kept["quality"]), 1e-6)
+            area_a = bbox_area_pixels(proposal["bbox"], height, width)
+            area_b = bbox_area_pixels(kept["bbox"], height, width)
+            area_ratio = min(area_a, area_b) / max(max(area_a, area_b), 1.0)
+
+            if same_class and (
+                box_iou >= float(args.semantic_duplicate_iou)
+                or miou >= float(args.semantic_duplicate_mask_iou)
+            ):
+                suppress = True
+                reason = "same_class_duplicate"
+            elif compatible and (
+                box_iou >= float(args.semantic_duplicate_iou)
+                or miou >= float(args.semantic_duplicate_mask_iou)
+            ):
+                suppress = True
+                reason = "semantic_compatible_duplicate"
+            elif (
+                box_iou >= float(args.semantic_incompatible_iou)
+                and miou >= float(args.semantic_incompatible_mask_iou)
+                and quality_ratio <= float(args.semantic_min_score_ratio)
+                and area_ratio >= float(args.semantic_min_area_ratio)
+            ):
+                suppress = True
+                reason = "incompatible_exact_duplicate"
+
+            if suppress:
+                matched = {
+                    "kept_index": int(kept["idx"]),
+                    "kept_category": str(kept["name"]),
+                    "kept_group": str(kept["group"]),
+                    "bbox_iou": float(box_iou),
+                    "mask_iou": float(miou),
+                    "quality_ratio": float(quality_ratio),
+                    "area_ratio": float(area_ratio),
+                }
+                break
+
+        if suppress:
+            stats["semantic_filter_suppressed"] += 1
+            if reason == "same_class_duplicate":
+                stats["semantic_filter_suppressed_same_class"] += 1
+            elif reason == "semantic_compatible_duplicate":
+                stats["semantic_filter_suppressed_compatible"] += 1
+            elif reason == "incompatible_exact_duplicate":
+                stats["semantic_filter_suppressed_incompatible_duplicate"] += 1
+            metadata[idx].update(
+                {
+                    "semantic_filter_kept": False,
+                    "semantic_filter_reason": reason,
+                    "semantic_filter_matched": matched,
+                }
+            )
+            continue
+
+        keep.add(idx)
+        kept_items.append(proposal)
+        if float(proposal["quality"]) < float(args.semantic_min_score_ratio):
+            stats["semantic_filter_low_quality_kept"] += 1
+
+    return keep, metadata, stats
 
 
 def binary_dilate(mask_bool: np.ndarray, radius: int) -> np.ndarray:
@@ -4896,6 +5155,17 @@ def main():
         ).reshape(-1)
         n = min(len(phrases), len(boxes), mask.shape[0], raw_mask.shape[0])
         stats["objects_seen"] += int(n)
+        semantic_keep_indices, semantic_metadata, semantic_stats = semantic_compatibility_filter(
+            phrases,
+            boxes,
+            raw_mask,
+            scores,
+            width,
+            height,
+            args,
+        )
+        for stat_key, stat_value in semantic_stats.items():
+            stats[stat_key] += int(stat_value)
         used_anchor_ids = set()
 
         for j in range(n):
@@ -4927,6 +5197,13 @@ def main():
                 "proposal_source_index": int(proposal_source_index),
                 "proposal_2d_score": float(score),
             }
+            extra.update(semantic_metadata.get(j, {}))
+            if bool(args.use_semantic_compatibility_filter) and j not in semantic_keep_indices:
+                stats["skipped_semantic_compatibility"] += 1
+                reason = str(extra.get("semantic_filter_reason", "unknown"))
+                if reason:
+                    stats[f"skipped_semantic_{reason}"] += 1
+                continue
             proposal_quality = proposal_quality_metrics(
                 score,
                 bbox,
@@ -5456,6 +5733,8 @@ def main():
         method_name = "geometry_verified_cuboid_optimizer_step3"
     elif args.use_openbox_bidirectional_cluster_refine:
         method_name = "openbox_bidirectional_cluster_refine_original_pca"
+    elif args.use_semantic_compatibility_filter:
+        method_name = "group3d_semantic_compatibility_filter_original_pca"
     elif (
         args.use_depth_edge_filter
         or args.use_depth_aware_mask_selector
@@ -5469,6 +5748,13 @@ def main():
     output["info"]["pseudo_label_method"] = method_name
     output["info"]["pseudo_label_source_json"] = os.path.abspath(args.source_json)
     output["info"]["pseudo_label_cache_root"] = os.path.abspath(input_folder)
+    output["info"]["group3d_semantic_compatibility_filter"] = bool(
+        args.use_semantic_compatibility_filter
+    )
+    output["info"]["semantic_duplicate_iou"] = float(args.semantic_duplicate_iou)
+    output["info"]["semantic_duplicate_mask_iou"] = float(args.semantic_duplicate_mask_iou)
+    output["info"]["semantic_incompatible_iou"] = float(args.semantic_incompatible_iou)
+    output["info"]["semantic_incompatible_mask_iou"] = float(args.semantic_incompatible_mask_iou)
     output["info"]["depth_aware_mask_selector"] = bool(args.use_depth_aware_mask_selector)
     output["info"]["drop_invalid_annotations"] = bool(args.drop_invalid_annotations)
     output["info"]["core_extent_masks"] = bool(args.use_core_extent_masks)
