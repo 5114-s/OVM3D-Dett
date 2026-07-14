@@ -136,6 +136,9 @@ def process_outdoor(dataset, cat_prior, input_folder, output_folder):
 
 
 def estimate_bbox(in_pc, prior, catgory_name, ground_equ=None):
+    fix_candidate_consistency = str(
+        os.environ.get("OVM3D_FIX_CANDIDATE_CONSISTENCY", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
     # Subsample input point cloud if needed
     if in_pc.shape[0] > 500:
         rand_ind = np.random.randint(0, in_pc.shape[0], 500)
@@ -197,6 +200,10 @@ def estimate_bbox(in_pc, prior, catgory_name, ground_equ=None):
         # generate all the proposal boxes.
         possible_bboxs = generate_possible_bboxs(cx, cz, dx, dz, w, l)
         min_loss, min_vertives = float('inf'), None
+        min_dimension = None
+        fallback_inside_ratio = float('-inf')
+        fallback_vertives = None
+        fallback_dimension = None
         
         # find the best proposal box.
         for possible_bbox in possible_bboxs:
@@ -215,14 +222,40 @@ def estimate_bbox(in_pc, prior, catgory_name, ground_equ=None):
 
             loss = loss_ray_tracing + 10 * loss_inside_ratio
 
+            if (
+                fix_candidate_consistency
+                and np.isfinite(inside_ratio)
+                and np.all(np.isfinite(vertives))
+                and inside_ratio > fallback_inside_ratio
+            ):
+                fallback_inside_ratio = float(inside_ratio)
+                fallback_vertives = vertives
+                fallback_dimension = [dz, dy, dx]
+
             if loss < min_loss:
                 min_loss = loss
                 min_vertives = vertives
+                if fix_candidate_consistency:
+                    # Preserve the dimensions of the same candidate as the
+                    # selected vertices.  Without this opt-in ablation, retain
+                    # the exact released behavior for baseline reproduction.
+                    min_dimension = [dz, dy, dx]
+
+        if fix_candidate_consistency and min_vertives is None:
+            if fallback_vertives is None:
+                return (
+                    [np.full((8, 3), -1)],
+                    [-1 * np.ones(3)],
+                    [[-1, -1, -1]],
+                    [-1 * np.ones((3, 3))],
+                )
+            min_vertives = fallback_vertives
+            min_dimension = fallback_dimension
         
         min_vertives = np.dot(min_vertives, rotation_matrix.T)
         vertives_list.append(min_vertives)
         center_cam = min_vertives.mean(0)
-        dimension = [dz, dy, dx]
+        dimension = min_dimension if fix_candidate_consistency else [dz, dy, dx]
         R_cam = rotation_matrix @ rotate_y(-yaw)
         center_cam_list.append(center_cam)
         dimension_list.append(dimension)

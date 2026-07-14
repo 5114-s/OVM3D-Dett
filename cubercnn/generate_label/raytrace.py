@@ -1,6 +1,19 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+import os
+
+
+def _released_sparse_ray_fallback_enabled():
+    """Use the sparse-ray behavior from the released OVM3D-Det code.
+
+    The pristine repository returns zero when fewer than three rays support a
+    candidate.  This working tree previously changed that value to infinity.
+    Keep the working-tree default intact, but allow paired ablations to opt
+    into the released behavior explicitly.
+    """
+    value = os.environ.get("OVM3D_RELEASED_SPARSE_RAY_ZERO", "0")
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 def calc_dis_ray_tracing(wl, Ry, points, bev_box_center):
     init_theta, length = torch.atan(wl[0] / wl[1]), torch.sqrt(wl[0] ** 2 + wl[1] ** 2) / 2  # 0.5:1
@@ -84,6 +97,8 @@ def calc_dis_ray_tracing(wl, Ry, points, bev_box_center):
 
     dis_in = (torch.sum(dis_in_mul, dim=1) == 2).type(torch.bool)
     if torch.sum(dis_in.int()) < 3:
+        if _released_sparse_ray_fallback_enabled():
+            return 0.0
         return float('inf')
 
     dis_in = dis_in.squeeze(0)

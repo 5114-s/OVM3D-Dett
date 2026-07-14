@@ -155,6 +155,9 @@ def main() -> None:
     num_categories = int(train_data["category_indices"].max().item()) + 1
     if val_data is not None:
         num_categories = max(num_categories, int(val_data["category_indices"].max().item()) + 1)
+    category_map = train_data.get("category_id_to_index") or {}
+    if category_map:
+        num_categories = max(num_categories, max(int(v) for v in category_map.values()) + 1)
     model = ResidualLiftHead(
         feature_dim=train_data["features"].shape[1],
         num_categories=num_categories,

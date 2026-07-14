@@ -9,7 +9,7 @@ import json
 import math
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Mapping, Set
 
 import numpy as np
 import torch
@@ -77,6 +77,16 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Use checkpoint depth config by default; override only for debugging.",
     )
+    parser.add_argument(
+        "--only_categories",
+        default="",
+        help="Optional comma-separated category names/ids to correct. Others are kept unchanged.",
+    )
+    parser.add_argument(
+        "--skip_categories",
+        default="",
+        help="Optional comma-separated category names/ids to keep unchanged.",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +103,43 @@ def is_valid_ann(ann: dict) -> bool:
     return center.shape[0] == 3 and dims.shape[0] == 3 and np.all(np.isfinite(center)) and np.all(np.isfinite(dims)) and center[2] > 0.05 and np.all(dims > 0)
 
 
+def _normalize_category_token(value: object) -> str:
+    return str(value).strip().lower().replace("_", " ")
+
+
+def parse_category_filter(raw: str) -> Set[str]:
+    if not raw:
+        return set()
+    return {_normalize_category_token(tok) for tok in raw.split(",") if tok.strip()}
+
+
+def category_names_by_id(categories: List[Mapping]) -> Dict[int, str]:
+    names: Dict[int, str] = {}
+    for cat in categories or []:
+        if "id" not in cat:
+            continue
+        names[int(cat["id"])] = str(cat.get("name", cat.get("name_readable", cat["id"])))
+    return names
+
+
+def category_allowed(
+    ann: Mapping,
+    names_by_id: Mapping[int, str],
+    only: Set[str],
+    skip: Set[str],
+) -> bool:
+    cat_id = int(ann.get("category_id", -1))
+    tokens = {
+        _normalize_category_token(cat_id),
+        _normalize_category_token(names_by_id.get(cat_id, cat_id)),
+    }
+    if only and tokens.isdisjoint(only):
+        return False
+    if skip and not tokens.isdisjoint(skip):
+        return False
+    return True
+
+
 def main() -> None:
     args = parse_args()
     if torch.cuda.is_available() and not args.force_cpu:
@@ -102,6 +149,9 @@ def main() -> None:
         device = torch.device("cpu")
 
     source = load_json(args.source_json)
+    only_categories = parse_category_filter(args.only_categories)
+    skip_categories = parse_category_filter(args.skip_categories)
+    names_by_id = category_names_by_id(source.get("categories", []))
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     model_args = ckpt["model_args"]
     model = ResidualLiftHead(**model_args)
@@ -179,6 +229,8 @@ def main() -> None:
             continue
         if not is_valid_ann(ann):
             continue
+        if not category_allowed(ann, names_by_id, only_categories, skip_categories):
+            continue
         image = image_by_id.get(int(ann["image_id"]))
         if image is None:
             continue
@@ -211,6 +263,16 @@ def main() -> None:
     stats = {
         "source_annotations": len(output.get("annotations", [])),
         "candidate_annotations": len(ann_indices),
+        "only_categories": sorted(only_categories),
+        "skip_categories": sorted(skip_categories),
+        "skipped_by_category": len(
+            [
+                ann
+                for ann in output.get("annotations", [])
+                if is_valid_ann(ann)
+                and not category_allowed(ann, names_by_id, only_categories, skip_categories)
+            ]
+        ),
         "corrected": 0,
         "kept_original_projection_gate": 0,
         "score_repaired": 0,

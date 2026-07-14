@@ -47,8 +47,14 @@ from cubercnn.modeling.proposal_generator import RPNWithIgnore
 from cubercnn.modeling.roi_heads import ROIHeads3D_Text
 from cubercnn.modeling.meta_arch import RCNN3D_text, build_model
 from cubercnn.modeling.backbone import build_dla_from_vision_fpn_backbone
-from cubercnn import util, data, generate_label
-from cubercnn.generate_label import llm_generated_prior
+from cubercnn import util, data
+# Keep the pseudo-label generator on the priors shipped with the original
+# OVM3D-Det route.  Importing ``llm_generated_prior`` from the package now
+# resolves to the similarly named module after the lightweight package-init
+# refactor, rather than to the dictionary expected below.
+from cubercnn.generate_label.priors import llm_generated_prior
+from cubercnn.generate_label.process_indoor import process_indoor
+from cubercnn.generate_label.process_outdoor import process_outdoor
 import cubercnn.vis.logperf as utils_logperf
 
 MAX_TRAINING_ATTEMPTS = 10
@@ -71,13 +77,13 @@ def generate_pseudo_label(cfg):
         cat_prior = llm_generated_prior[dataset]
 
         if dataset in ['SUNRGBD', 'ARKitScenes']: # indoor datasets
-            generate_label.process_indoor(
-            data_loader.dataset, cat_prior, input_folder, output_folder
-        )
+            process_indoor(
+                data_loader.dataset, cat_prior, input_folder, output_folder
+            )
         else:  # outdoor datasets
-            generate_label.process_outdoor(
-            data_loader.dataset, cat_prior, input_folder, output_folder
-        )
+            process_outdoor(
+                data_loader.dataset, cat_prior, input_folder, output_folder
+            )
 
 
 def setup(args):

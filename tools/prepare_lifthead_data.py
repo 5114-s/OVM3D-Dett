@@ -12,7 +12,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Set, Tuple
 
 import numpy as np
 import torch
@@ -87,6 +87,16 @@ def parse_args() -> argparse.Namespace:
         help="Append Boxer-style robust depth patch statistics to LiftHead features.",
     )
     parser.add_argument("--depth_context_scale", type=float, default=1.05)
+    parser.add_argument(
+        "--include_categories",
+        default="",
+        help="Optional comma-separated category names/ids to keep.",
+    )
+    parser.add_argument(
+        "--exclude_categories",
+        default="",
+        help="Optional comma-separated category names/ids to remove, e.g. the novel split.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +115,45 @@ def is_valid_3d(ann: Mapping) -> bool:
     if not (np.all(np.isfinite(center)) and np.all(np.isfinite(dims))):
         return False
     if center[2] <= 0.05 or np.any(dims <= 0):
+        return False
+    return True
+
+
+def _normalize_category_token(value: object) -> str:
+    return str(value).strip().lower().replace("_", " ")
+
+
+def parse_category_filter(raw: str) -> Set[str]:
+    if not raw:
+        return set()
+    return {_normalize_category_token(tok) for tok in raw.split(",") if tok.strip()}
+
+
+def category_names_by_id(*category_lists: List[Mapping]) -> Dict[int, str]:
+    names: Dict[int, str] = {}
+    for categories in category_lists:
+        for cat in categories or []:
+            if "id" not in cat:
+                continue
+            name = cat.get("name", cat.get("name_readable", cat["id"]))
+            names[int(cat["id"])] = str(name)
+    return names
+
+
+def category_allowed(
+    ann: Mapping,
+    names_by_id: Mapping[int, str],
+    include: Set[str],
+    exclude: Set[str],
+) -> bool:
+    cat_id = int(ann.get("category_id", -1))
+    tokens = {
+        _normalize_category_token(cat_id),
+        _normalize_category_token(names_by_id.get(cat_id, cat_id)),
+    }
+    if include and tokens.isdisjoint(include):
+        return False
+    if exclude and not tokens.isdisjoint(exclude):
         return False
     return True
 
@@ -176,9 +225,20 @@ def main() -> None:
     if not image_by_id:
         raise ValueError("source_json has no images")
 
+    include_categories = parse_category_filter(args.include_categories)
+    exclude_categories = parse_category_filter(args.exclude_categories)
+    names_by_id = category_names_by_id(source.get("categories", []), target.get("categories", []))
     cat_to_idx = build_category_index(source.get("categories", target.get("categories", [])))
-    target_grouped = group_annotations(target.get("annotations", []), is_valid_3d)
-    source_grouped = group_annotations(source.get("annotations", []), lambda ann: source_ok(ann, args))
+    target_grouped = group_annotations(
+        target.get("annotations", []),
+        lambda ann: is_valid_3d(ann)
+        and category_allowed(ann, names_by_id, include_categories, exclude_categories),
+    )
+    source_grouped = group_annotations(
+        source.get("annotations", []),
+        lambda ann: source_ok(ann, args)
+        and category_allowed(ann, names_by_id, include_categories, exclude_categories),
+    )
 
     features = []
     category_indices = []
@@ -285,6 +345,11 @@ def main() -> None:
         "category_id_to_index": cat_to_idx,
         "source_json": os.path.abspath(args.source_json),
         "target_json": os.path.abspath(args.target_json),
+        "category_filter": {
+            "include_categories": sorted(include_categories),
+            "exclude_categories": sorted(exclude_categories),
+            "category_names_by_id": {int(k): v for k, v in names_by_id.items()},
+        },
         "stats": {
             "source_annotations": len(source.get("annotations", [])),
             "target_annotations": len(target.get("annotations", [])),

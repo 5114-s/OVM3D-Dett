@@ -58,6 +58,37 @@ DEFAULT_CKPT = os.path.join(
 _GSAM_MODULE = None
 
 
+SUNRGBD_GSAM_ALIASES = {
+    "monitor": ["monitor", "computer monitor", "display monitor", "screen"],
+    "bag": ["bag", "backpack", "handbag", "suitcase"],
+    "dresser": ["dresser", "chest of drawers", "clothes dresser"],
+    "board": ["board", "whiteboard", "blackboard", "notice board"],
+    "printer": ["printer"],
+    "keyboard": ["keyboard", "computer keyboard"],
+    "painting": ["painting", "wall painting", "picture frame", "framed picture"],
+    "drawers": ["drawers", "drawer", "set of drawers"],
+    "microwave": ["microwave", "microwave oven"],
+    "computer": ["computer", "desktop computer", "computer tower"],
+    "kitchen pan": ["kitchen pan", "pan", "cooking pan", "frying pan"],
+    "potted plant": ["potted plant", "plant in pot", "houseplant"],
+    "tissues": ["tissues", "tissue box", "box of tissues"],
+    "rack": ["rack", "storage rack", "shelf rack"],
+    "tray": ["tray", "serving tray"],
+    "toys": ["toys", "toy"],
+    "phone": ["phone", "telephone", "cell phone"],
+    "podium": ["podium", "lectern"],
+    "cart": ["cart", "trolley", "utility cart"],
+    "soundsystem": ["soundsystem", "sound system", "speaker", "audio system"],
+    "fire place": ["fire place", "fireplace"],
+}
+
+GSAM_ALIAS_TO_CANONICAL = {
+    alias.lower(): canonical
+    for canonical, aliases in SUNRGBD_GSAM_ALIASES.items()
+    for alias in aliases
+}
+
+
 @dataclass
 class Box2DEntry:
     ann: dict
@@ -67,6 +98,7 @@ class Box2DEntry:
     score: float
     source_index: int = -1
     mask: Optional[np.ndarray] = None
+    bbox_source: str = "unknown"
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,8 +144,9 @@ def parse_args() -> argparse.Namespace:
         choices=["json", "gsam", "original_gsam", "external_2d", "detic", "detany3d"],
         default="json",
         help=(
-            "Use 2D boxes from input JSON, generate them with Grounding-SAM2, "
-            "read original OVM3D Step-2 pseudo_label/<dataset>/<split>/info.pth, "
+            "Use 2D boxes from input JSON, generate them online with Grounding-SAM2, "
+            "read the original cached OVM3D GroundingSAM Step-2 "
+            "pseudo_label/<dataset>/<split>/info.pth, "
             "read an external 2D aggregator JSON, read Detic proposals, "
             "or read DetAny3D inference output."
         ),
@@ -235,10 +268,91 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text_threshold", type=float, default=0.2)
     parser.add_argument("--gsam_iou_threshold", type=float, default=0.9)
     parser.add_argument(
+        "--gsam_prompt_mode",
+        choices=["joint", "per_class"],
+        default="joint",
+        help=(
+            "Grounding-SAM2 prompt strategy. 'joint' matches the original "
+            "single long prompt. 'per_class' queries each class separately, "
+            "which is slower but avoids long-prompt class competition."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_use_sunrgbd_aliases",
+        action="store_true",
+        help=(
+            "Use SUNRGBD alias prompts and canonicalize returned phrases "
+            "(e.g. fireplace -> fire place, computer monitor -> monitor)."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_class_nms_iou",
+        type=float,
+        default=0.80,
+        help="Cross-class NMS IoU for per-class Grounding-SAM2 detections.",
+    )
+    parser.add_argument(
+        "--gsam_per_class_max_det",
+        type=int,
+        default=30,
+        help="Maximum kept detections per class before cross-class NMS.",
+    )
+    parser.add_argument(
+        "--gsam_class_box_thresholds",
+        default="",
+        help=(
+            "Optional per-class box thresholds, e.g. "
+            "'dresser:0.35,drawers:0.35,board:0.25'."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_class_text_thresholds",
+        default="",
+        help=(
+            "Optional per-class text thresholds, e.g. "
+            "'dresser:0.30,drawers:0.30'."
+        ),
+    )
+    parser.add_argument(
         "--gsam_box_from",
         choices=["mask", "box"],
         default="mask",
         help="Use SAM2 mask bounding boxes or raw GroundingDINO boxes.",
+    )
+    parser.add_argument(
+        "--no_gsam_mask_box_fallback",
+        action="store_true",
+        help=(
+            "When --gsam_box_from mask is used, do not fall back to the raw "
+            "GroundingDINO box if the SAM2 mask box is geometrically suspicious."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_mask_box_min_iou_with_detector",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum IoU between the SAM2 mask bounding box and the raw "
+            "GroundingDINO box. Lower values trigger a fallback to the detector box."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_mask_box_min_area_ratio_to_detector",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum mask-box/detector-box area ratio accepted before falling "
+            "back to the detector box."
+        ),
+    )
+    parser.add_argument(
+        "--gsam_mask_box_max_area_ratio_to_detector",
+        type=float,
+        default=3.0,
+        help=(
+            "Maximum mask-box/detector-box area ratio accepted before falling "
+            "back to the detector box."
+        ),
     )
     parser.add_argument("--min_2d_area_ratio", type=float, default=0.0002)
     parser.add_argument("--max_2d_area_ratio", type=float, default=0.85)
@@ -1225,6 +1339,78 @@ def load_gsam_helpers():
     }
 
 
+def parse_prompt_categories(text_prompt: str, use_aliases: bool = False) -> List[str]:
+    categories: List[str] = []
+    for raw in text_prompt.split("."):
+        name = str(raw).strip().lower()
+        if not name:
+            continue
+        if use_aliases:
+            name = GSAM_ALIAS_TO_CANONICAL.get(name, name)
+        if name not in categories:
+            categories.append(name)
+    return categories
+
+
+def gsam_aliases_for_category(category: str, use_aliases: bool) -> List[str]:
+    category = str(category).strip().lower()
+    if not use_aliases:
+        return [category]
+    aliases = SUNRGBD_GSAM_ALIASES.get(category, [category])
+    # Keep the canonical name first; GroundingDINO is sensitive to prompt order.
+    ordered = [category] + [a for a in aliases if a != category]
+    return list(dict.fromkeys([a.strip().lower() for a in ordered if a.strip()]))
+
+
+def canonicalize_gsam_label(label: str, fallback: Optional[str], use_aliases: bool) -> str:
+    label_norm = str(label).strip().lower()
+    if use_aliases:
+        if label_norm in GSAM_ALIAS_TO_CANONICAL:
+            return GSAM_ALIAS_TO_CANONICAL[label_norm]
+        # GroundingDINO occasionally returns a phrase containing one alias
+        # rather than the exact alias token.
+        for alias, canonical in sorted(
+            GSAM_ALIAS_TO_CANONICAL.items(), key=lambda kv: len(kv[0]), reverse=True
+        ):
+            if alias and alias in label_norm:
+                return canonical
+    if fallback is not None:
+        return str(fallback).strip().lower()
+    return label_norm
+
+
+def parse_class_float_overrides(spec: str) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    if not spec:
+        return values
+    for item in spec.split(","):
+        if not item.strip() or ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        key = key.strip().lower()
+        key = GSAM_ALIAS_TO_CANONICAL.get(key, key)
+        try:
+            values[key] = float(value)
+        except ValueError:
+            continue
+    return values
+
+
+def nms_box2d_entries(entries: List[Box2DEntry], iou_threshold: float) -> List[Box2DEntry]:
+    if iou_threshold <= 0 or len(entries) <= 1:
+        return entries
+    kept: List[Box2DEntry] = []
+    for entry in sorted(entries, key=lambda x: float(x.score), reverse=True):
+        suppress = False
+        for kept_entry in kept:
+            if bbox_iou(entry.bbox_xyxy, kept_entry.bbox_xyxy) >= iou_threshold:
+                suppress = True
+                break
+        if not suppress:
+            kept.append(entry)
+    return kept
+
+
 def build_gsam_entries(
     image_path: str,
     image_width: int,
@@ -1240,76 +1426,180 @@ def build_gsam_entries(
     from grounding_dino.groundingdino.util.inference import load_image
 
     image_source, image_transformed = load_image(image_path)
-    valid_categories = [cat.strip() for cat in text_prompt.split(".") if cat.strip()]
-    seg = gsam_helpers["segment_with_grounding_sam2"](
-        image_source=image_source,
-        image_transformed=image_transformed,
-        text_prompt=text_prompt,
-        grounding_dino_model=grounding_dino_model,
-        sam2_predictor=sam_predictor,
-        box_threshold=args.box_threshold,
-        text_threshold=args.text_threshold,
-        iou_threshold=args.gsam_iou_threshold,
-        valid_categories=valid_categories,
+    valid_categories = parse_prompt_categories(
+        text_prompt, use_aliases=bool(args.gsam_use_sunrgbd_aliases)
     )
-
     entries: List[Box2DEntry] = []
     det_records = []
-    for idx, (box, label, score) in enumerate(
-        zip(seg["boxes"], seg["labels"], seg["scores"])
-    ):
-        bbox = None
-        if args.gsam_box_from == "mask" and idx < len(seg.get("masks", [])):
-            bbox = gsam_helpers["mask_to_xyxy_pixels"](seg["masks"][idx])
-        if bbox is None:
-            bbox = gsam_helpers["convert_detection_box_to_xyxy_pixels"](
+    mask_box_used = 0
+    mask_box_fallback = 0
+
+    def append_seg(seg: dict, fallback_label: Optional[str], source_offset: int) -> int:
+        nonlocal mask_box_used, mask_box_fallback
+        local_entries: List[Box2DEntry] = []
+        for idx, (box, label, score) in enumerate(
+            zip(seg["boxes"], seg["labels"], seg["scores"])
+        ):
+            detector_bbox = gsam_helpers["convert_detection_box_to_xyxy_pixels"](
                 box, image_width, image_height
             )
-        bbox = valid_bbox_xyxy(bbox, image_width, image_height)
-        if bbox is None:
-            continue
-        area_ratio = bbox_area_ratio(bbox, image_width, image_height)
-        if area_ratio < args.min_2d_area_ratio or area_ratio > args.max_2d_area_ratio:
-            continue
+            detector_bbox = valid_bbox_xyxy(detector_bbox, image_width, image_height)
+            mask_bbox = None
+            if args.gsam_box_from == "mask" and idx < len(seg.get("masks", [])):
+                mask_bbox = gsam_helpers["mask_to_xyxy_pixels"](seg["masks"][idx])
+                mask_bbox = valid_bbox_xyxy(mask_bbox, image_width, image_height)
 
-        label_str = str(label).lower().strip()
-        category_id = cat_name_to_id.get(label_str, -1)
-        if category_id < 0:
-            continue
-        ann_stub = {
-            "image_id": int(image_id),
-            "category_name": label_str,
-            "category_id": int(category_id),
-            "bbox2D_tight": [float(x) for x in bbox],
-            "score": float(score),
-            "visibility": 1.0,
-            "truncation": 0.0,
-        }
-        entry_mask = None
-        if idx < len(seg.get("masks", [])):
-            entry_mask = squeeze_instance_mask(seg["masks"][idx])
-        entries.append(
-            Box2DEntry(
-                ann=ann_stub,
-                bbox_xyxy=[float(x) for x in bbox],
-                label=label_str,
-                category_id=int(category_id),
-                score=float(score),
-                source_index=int(idx),
-                mask=entry_mask,
+            bbox = detector_bbox
+            bbox_source = "box"
+            if args.gsam_box_from == "mask":
+                if mask_bbox is not None and detector_bbox is not None:
+                    det_area = max(1e-6, bbox_area_ratio(detector_bbox, image_width, image_height))
+                    mask_area = bbox_area_ratio(mask_bbox, image_width, image_height)
+                    area_ratio = mask_area / det_area
+                    mask_detector_iou = bbox_iou(mask_bbox, detector_bbox)
+                    mask_is_sane = (
+                        bool(args.no_gsam_mask_box_fallback)
+                        or (
+                            area_ratio >= float(args.gsam_mask_box_min_area_ratio_to_detector)
+                            and area_ratio <= float(args.gsam_mask_box_max_area_ratio_to_detector)
+                            and mask_detector_iou >= float(args.gsam_mask_box_min_iou_with_detector)
+                        )
+                    )
+                    if mask_is_sane:
+                        bbox = mask_bbox
+                        bbox_source = "mask"
+                        mask_box_used += 1
+                    else:
+                        bbox = detector_bbox
+                        bbox_source = "box_fallback_from_mask"
+                        mask_box_fallback += 1
+                elif mask_bbox is not None:
+                    bbox = mask_bbox
+                    bbox_source = "mask_no_detector_box"
+                    mask_box_used += 1
+                else:
+                    bbox = detector_bbox
+                    bbox_source = "box_fallback_no_mask"
+                    mask_box_fallback += 1
+
+            if bbox is None:
+                continue
+            image_area_ratio = bbox_area_ratio(bbox, image_width, image_height)
+            if (
+                image_area_ratio < args.min_2d_area_ratio
+                or image_area_ratio > args.max_2d_area_ratio
+            ):
+                continue
+
+            label_str = canonicalize_gsam_label(
+                label,
+                fallback=fallback_label if args.gsam_prompt_mode == "per_class" else None,
+                use_aliases=bool(args.gsam_use_sunrgbd_aliases),
             )
-        )
-        det_records.append(
-            {
+            if label_str not in valid_categories:
+                continue
+            category_id = cat_name_to_id.get(label_str, -1)
+            if category_id < 0:
+                continue
+            ann_stub = {
                 "image_id": int(image_id),
                 "category_name": label_str,
                 "category_id": int(category_id),
-                "bbox": [float(x) for x in bbox],
+                "bbox2D_tight": [float(x) for x in bbox],
                 "score": float(score),
-                "source": f"grounding_sam2_{args.gsam_box_from}",
+                "visibility": 1.0,
+                "truncation": 0.0,
+            }
+            entry_mask = None
+            if idx < len(seg.get("masks", [])):
+                entry_mask = squeeze_instance_mask(seg["masks"][idx])
+            local_entries.append(
+                Box2DEntry(
+                    ann=ann_stub,
+                    bbox_xyxy=[float(x) for x in bbox],
+                    label=label_str,
+                    category_id=int(category_id),
+                    score=float(score),
+                    source_index=int(source_offset + idx),
+                    mask=entry_mask,
+                    bbox_source=bbox_source,
+                )
+            )
+        if fallback_label is not None and args.gsam_per_class_max_det > 0:
+            local_entries.sort(key=lambda x: float(x.score), reverse=True)
+            del local_entries[int(args.gsam_per_class_max_det) :]
+        entries.extend(local_entries)
+        return source_offset + len(seg.get("labels", []))
+
+    if args.gsam_prompt_mode == "per_class":
+        box_overrides = parse_class_float_overrides(args.gsam_class_box_thresholds)
+        text_overrides = parse_class_float_overrides(args.gsam_class_text_thresholds)
+        source_offset = 0
+        raw_count = 0
+        for category in valid_categories:
+            if category not in cat_name_to_id:
+                continue
+            aliases = gsam_aliases_for_category(
+                category, use_aliases=bool(args.gsam_use_sunrgbd_aliases)
+            )
+            prompt = ". ".join(aliases)
+            seg = gsam_helpers["segment_with_grounding_sam2"](
+                image_source=image_source,
+                image_transformed=image_transformed,
+                text_prompt=prompt,
+                grounding_dino_model=grounding_dino_model,
+                sam2_predictor=sam_predictor,
+                box_threshold=box_overrides.get(category, args.box_threshold),
+                text_threshold=text_overrides.get(category, args.text_threshold),
+                iou_threshold=args.gsam_iou_threshold,
+                valid_categories=aliases,
+            )
+            raw_count += len(seg.get("labels", []))
+            source_offset = append_seg(seg, fallback_label=category, source_offset=source_offset)
+        entries = nms_box2d_entries(entries, float(args.gsam_class_nms_iou))
+    else:
+        prompt_categories = []
+        for category in valid_categories:
+            prompt_categories.extend(
+                gsam_aliases_for_category(
+                    category, use_aliases=bool(args.gsam_use_sunrgbd_aliases)
+                )
+            )
+        prompt_categories = list(dict.fromkeys(prompt_categories))
+        prompt = ". ".join(prompt_categories)
+        seg = gsam_helpers["segment_with_grounding_sam2"](
+            image_source=image_source,
+            image_transformed=image_transformed,
+            text_prompt=prompt,
+            grounding_dino_model=grounding_dino_model,
+            sam2_predictor=sam_predictor,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            iou_threshold=args.gsam_iou_threshold,
+            valid_categories=prompt_categories,
+        )
+        raw_count = len(seg.get("labels", []))
+        append_seg(seg, fallback_label=None, source_offset=0)
+
+    for entry in entries:
+        det_records.append(
+            {
+                "image_id": int(image_id),
+                "category_name": entry.label,
+                "category_id": int(entry.category_id),
+                "bbox": [float(x) for x in entry.bbox_xyxy],
+                "score": float(entry.score),
+                "source": f"grounding_sam2_{entry.bbox_source}_{args.gsam_prompt_mode}",
             }
         )
-    return entries, {"detections": det_records, "raw_count": len(seg["labels"])}
+    return entries, {
+        "detections": det_records,
+        "raw_count": int(raw_count),
+        "prompt_mode": args.gsam_prompt_mode,
+        "use_aliases": bool(args.gsam_use_sunrgbd_aliases),
+        "mask_box_used": int(mask_box_used),
+        "mask_box_fallback": int(mask_box_fallback),
+    }
 
 
 def load_rgb(path: str) -> np.ndarray:
