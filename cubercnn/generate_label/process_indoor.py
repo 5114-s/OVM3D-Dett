@@ -13,6 +13,11 @@ from cubercnn.generate_label.projection_selection import (
     get_projection_selection_cfg,
     select_projected_candidate,
 )
+from cubercnn.generate_label.yaw_disambiguation import (
+    disabled_yaw_metric,
+    get_prior_yaw_cfg,
+    select_prior_conditioned_yaw,
+)
 from tqdm import tqdm
 from sklearn.cluster import DBSCAN
 
@@ -250,6 +255,7 @@ def process_instances(
     cluster_cfg=None,
     raw_mask_instance=None,
     projection_cfg=None,
+    yaw_cfg=None,
 ):
     """Process each instance to generate 3D bounding boxes."""
     boxes3d = []
@@ -258,6 +264,7 @@ def process_instances(
     R_cam_list = []
     cluster_stats = []
     projection_stats = []
+    yaw_stats = []
 
     for mask_ind, cur_mask in enumerate(mask_instance):
         # Remove instances with masks that are too small which are not reliable
@@ -271,6 +278,16 @@ def process_instances(
             projection_stats.append(
                 disabled_selection_metric("small_mask")
                 if not (projection_cfg and projection_cfg.get("enabled", False))
+                else {
+                    "enabled": True,
+                    "eligible": False,
+                    "switched": False,
+                    "reason": "small_mask",
+                }
+            )
+            yaw_stats.append(
+                disabled_yaw_metric("small_mask")
+                if not (yaw_cfg and yaw_cfg.get("enabled", False))
                 else {
                     "enabled": True,
                     "eligible": False,
@@ -301,6 +318,14 @@ def process_instances(
             projection_stats.append(
                 {
                     "enabled": bool(projection_cfg and projection_cfg.get("enabled", False)),
+                    "eligible": False,
+                    "switched": False,
+                    "reason": "too_few_depth_points",
+                }
+            )
+            yaw_stats.append(
+                {
+                    "enabled": bool(yaw_cfg and yaw_cfg.get("enabled", False)),
                     "eligible": False,
                     "switched": False,
                     "reason": "too_few_depth_points",
@@ -344,6 +369,8 @@ def process_instances(
             K=K,
             projection_cfg=projection_cfg,
             return_selection_metrics=True,
+            yaw_cfg=yaw_cfg,
+            return_yaw_metrics=True,
         )
 
         boxes3d.extend(bbox_params[0])
@@ -352,6 +379,7 @@ def process_instances(
         R_cam_list.extend(bbox_params[3])
         cluster_stats.append(cluster_metric)
         projection_stats.append(bbox_params[4])
+        yaw_stats.append(bbox_params[5])
 
     return (
         boxes3d,
@@ -360,6 +388,7 @@ def process_instances(
         R_cam_list,
         cluster_stats,
         projection_stats,
+        yaw_stats,
     )
 
 
@@ -375,6 +404,7 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
     info_ground = torch.load(os.path.join(input_folder, 'info_ground.pth'))
     cluster_cfg = get_bidir_cluster_cfg()
     projection_cfg = get_projection_selection_cfg()
+    yaw_cfg = get_prior_yaw_cfg()
     cluster_totals = {
         "enabled": bool(cluster_cfg.get("enabled", False)),
         "instances": 0,
@@ -387,6 +417,16 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
         "eligible": 0,
         "switched": 0,
         "kept_original": 0,
+        "invalid": 0,
+    }
+    yaw_totals = {
+        "enabled": bool(yaw_cfg.get("enabled", False)),
+        "instances": 0,
+        "eligible": 0,
+        "switched": 0,
+        "kept_original": 0,
+        "near_square_prior": 0,
+        "low_scc_quality": 0,
         "invalid": 0,
     }
 
@@ -411,7 +451,7 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
         # np.save(f'{output_folder}/pseudo_lidar/{im_id}.npy', pseudo_lidar[:, :3])
 
         # Process instances and generate 3D bounding boxes
-        boxes3d, center_cam_list, dimension_list, R_cam_list, cluster_stats, projection_stats = process_instances(
+        boxes3d, center_cam_list, dimension_list, R_cam_list, cluster_stats, projection_stats, yaw_stats = process_instances(
             mask,
             depth,
             K,
@@ -422,6 +462,7 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
             cluster_cfg,
             raw_mask,
             projection_cfg,
+            yaw_cfg,
         )
         if cluster_cfg.get("enabled", False):
             cluster_totals["instances"] += len(cluster_stats)
@@ -451,6 +492,35 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
                     "invalid_projection_score",
                 }
             )
+        if yaw_cfg.get("enabled", False):
+            yaw_totals["instances"] += len(yaw_stats)
+            yaw_totals["eligible"] += sum(
+                1 for item in yaw_stats if item.get("eligible", False)
+            )
+            yaw_totals["switched"] += sum(
+                1 for item in yaw_stats if item.get("switched", False)
+            )
+            yaw_totals["kept_original"] += sum(
+                1 for item in yaw_stats if item.get("reason") == "kept_original"
+            )
+            yaw_totals["near_square_prior"] += sum(
+                1 for item in yaw_stats if item.get("reason") == "near_square_prior"
+            )
+            yaw_totals["low_scc_quality"] += sum(
+                1 for item in yaw_stats if item.get("reason") == "low_scc_quality"
+            )
+            yaw_totals["invalid"] += sum(
+                1
+                for item in yaw_stats
+                if item.get("reason")
+                in {
+                    "small_mask",
+                    "too_few_depth_points",
+                    "too_few_or_invalid_points",
+                    "invalid_prior",
+                    "invalid_score",
+                }
+            )
 
         # Update info dictionary
         info[im_id].update({
@@ -460,6 +530,7 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
             'R_cam': R_cam_list,
             'bidir_cluster_stats': cluster_stats,
             'projection_selection_stats': projection_stats,
+            'prior_yaw_stats': yaw_stats,
         })
 
         # # Save 3D bounding boxes
@@ -470,6 +541,8 @@ def process_indoor(dataset, cat_prior, input_folder, output_folder):
         info["_bidir_cluster_summary"] = cluster_totals
     if projection_cfg.get("enabled", False):
         info["_projection_selection_summary"] = projection_totals
+    if yaw_cfg.get("enabled", False):
+        info["_prior_yaw_summary"] = yaw_totals
     torch.save(info, os.path.join(input_folder, 'info_3d.pth'))
 
 
@@ -484,6 +557,8 @@ def estimate_bbox(
     K=None,
     projection_cfg=None,
     return_selection_metrics=False,
+    yaw_cfg=None,
+    return_yaw_metrics=False,
 ):
     fix_candidate_consistency = _env_bool(
         "OVM3D_FIX_CANDIDATE_CONSISTENCY", False
@@ -497,11 +572,17 @@ def estimate_bbox(
         "switched": False,
         "reason": "direct_fit" if use_projection_selection else "disabled",
     }
+    if yaw_cfg is None:
+        yaw_cfg = get_prior_yaw_cfg()
+    yaw_metric = disabled_yaw_metric()
 
     def finish(values):
+        extras = []
         if return_selection_metrics:
-            return (*values, selection_metric)
-        return values
+            extras.append(selection_metric)
+        if return_yaw_metrics:
+            extras.append(yaw_metric)
+        return (*values, *extras) if extras else values
 
     # Subsample input point cloud if needed
     if in_pc.shape[0] > 500:
@@ -527,6 +608,18 @@ def estimate_bbox(
     pca.fit(rotated_pc[:, [0, 2]])
     yaw_vec = pca.components_[0, :]
     yaw = np.arctan2(yaw_vec[1], yaw_vec[0])
+    yaw, yaw_metric = select_prior_conditioned_yaw(
+        rotated_pc,
+        prior,
+        yaw,
+        yaw_cfg,
+    )
+    yaw_switched = bool(yaw_metric.get("switched", False))
+    if yaw_metric.get("enabled", False):
+        explained = np.asarray(pca.explained_variance_, dtype=np.float64)
+        yaw_metric["pca_eigen_ratio"] = float(
+            explained[0] / max(explained[1], 1e-12)
+        )
 
     # Rotate the point cloud to align with the x-axis and z-axis
     rotated_pc_2 = rotate_y(yaw) @ rotated_pc.T
@@ -606,7 +699,7 @@ def estimate_bbox(
                 )
 
             if (
-                fix_candidate_consistency
+                (fix_candidate_consistency or yaw_switched)
                 and np.isfinite(inside_ratio)
                 and np.all(np.isfinite(vertives))
                 and inside_ratio > fallback_inside_ratio
@@ -622,7 +715,7 @@ def estimate_bbox(
                 min_loss = loss
                 min_vertives = vertives
                 original_index = int(candidate_index)
-                if fix_candidate_consistency:
+                if fix_candidate_consistency or yaw_switched:
                     # Keep every exported field tied to the candidate that
                     # actually minimized the unchanged original objective.
                     # The original code used dx/dz left over from the final
@@ -658,7 +751,7 @@ def estimate_bbox(
                 # actually replaced candidate exports its own dimensions.
                 min_dimension = selected["dimension_whl"]
 
-        if fix_candidate_consistency and min_vertives is None:
+        if (fix_candidate_consistency or yaw_switched) and min_vertives is None:
             if fallback_vertives is None:
                 return finish(
                     (
@@ -677,7 +770,11 @@ def estimate_bbox(
         if use_projection_selection and selection_metric.get("switched", False):
             dimension = min_dimension
         else:
-            dimension = min_dimension if fix_candidate_consistency else [dz, dy, dx]
+            dimension = (
+                min_dimension
+                if (fix_candidate_consistency or yaw_switched)
+                else [dz, dy, dx]
+            )
         R_cam = rotation_matrix @ rotate_y(-yaw)
         center_cam_list.append(center_cam)
         dimension_list.append(dimension)
